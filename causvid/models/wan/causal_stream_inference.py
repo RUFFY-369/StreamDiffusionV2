@@ -10,16 +10,18 @@ import torch.distributed as dist
 class CausalStreamInferencePipeline(torch.nn.Module):
     def __init__(self, args, device):
         super().__init__()
+        print(f"[DEBUG] CausalStreamInferencePipeline __init__: args={args}")
         model_type = args.model_type
+        print(f"[DEBUG] model_type resolved to: {model_type}")
         self.device = device
         # Step 1: Initialize all models
         self.generator_model_name = getattr(
             args, "generator_name", args.model_name)
         self.generator = get_diffusion_wrapper(
-            model_name=self.generator_model_name)(model_type=model_type)
+            model_name=self.generator_model_name)()
         self.text_encoder = get_text_encoder_wrapper(
-            model_name=args.model_name)(model_type=model_type)
-        self.vae = get_vae_wrapper(model_name=args.model_name)(model_type=model_type)
+            model_name=args.model_name)()
+        self.vae = get_vae_wrapper(model_name=args.model_name)()
 
         # Step 2: Initialize all causal hyperparmeters
         self._init_denoising_step_list(args, device)
@@ -36,9 +38,10 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         self.height = args.height//scale_size*2
         self.width = args.width//scale_size*2
         self.frame_seq_length = (args.height//scale_size) * (args.width//scale_size)
+        # Helper for dynamic sequence length
+        self.get_seq_length = lambda: self.img2img_seq_len if self.img2img_seq_len is not None else self.frame_seq_length
         self.kv_cache_length = self.frame_seq_length*args.num_kv_cache
         self.num_sink_tokens = args.num_sink_tokens
-        self.adapt_sink_threshold = args.adapt_sink_threshold
 
         self.conditional_dict = None
         self.kv_cache1 = None
@@ -48,6 +51,9 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         self.args = args
         self.num_frame_per_block = getattr(
             args, "num_frame_per_block", 1)
+
+        # For img2img cache length override
+        self.img2img_seq_len = None
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -74,11 +80,15 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         """
         kv_cache1 = []
         
+        # Detect img2img mode by presence of self.img2img_seq_len
+        cache_length = self.kv_cache_length
+        if hasattr(self, 'img2img_seq_len') and self.img2img_seq_len is not None:
+            cache_length = self.img2img_seq_len
+            print(f"DEBUG _initialize_kv_cache: img2img mode, cache_length={cache_length}")
+        else:
+            print(f"DEBUG _initialize_kv_cache: cache_length={cache_length}")
         for i in range(self.num_transformer_blocks):
-            cache_length = self.kv_cache_length
             self.generator.model.blocks[i].self_attn.sink_size = self.num_sink_tokens
-            self.generator.model.blocks[i].self_attn.adapt_sink_thr = self.adapt_sink_threshold
-
             kv_cache1.append({
                 "k": torch.zeros([batch_size, cache_length, self.num_heads, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, cache_length, self.num_heads, 128], dtype=dtype, device=device),
@@ -118,6 +128,14 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         self.device = device
         batch_size = noise.shape[0]
 
+        # Automatically set img2img_seq_len for img2img mode
+        # If input is img2img (single image repeated along T), set cache length accordingly
+        if noise is not None and noise.shape[2] != self.frame_seq_length:
+            self.img2img_seq_len = noise.shape[2]
+            print(f"[DEBUG] Auto-set img2img_seq_len to {self.img2img_seq_len} (img2img mode)")
+        else:
+            self.img2img_seq_len = None
+
         self.conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
@@ -135,6 +153,7 @@ class CausalStreamInferencePipeline(torch.nn.Module):
                 dtype=dtype,
                 device=device
             )
+            print('DEBUG kv_cache1[0]["k"].shape after init:', self.kv_cache1[0]['k'].shape)
         else:
             # reset cross attn cache
             for block_index in range(self.num_transformer_blocks):
@@ -216,19 +235,25 @@ class CausalStreamInferencePipeline(torch.nn.Module):
                     self.kv_cache1[i]['k'] = self.kv_cache1[i]['k'].cpu()
                     self.kv_cache1[i]['v'] = self.kv_cache1[i]['v'].cpu()
 
-        self.hidden_states = torch.zeros(
-            (self.batch_size, self.num_frame_per_block, *noise.shape[2:]), dtype=noise.dtype, device=device
-        )
+        # Conditional initialization for img2img vs vid2vid
+        if noise.shape[1] != self.num_frame_per_block:
+            # img2img: match noise shape
+            self.hidden_states = torch.zeros_like(noise)
+        else:
+            # vid2vid: original logic
+            self.hidden_states = torch.zeros(
+                (self.batch_size, self.num_frame_per_block, *noise.shape[2:]), dtype=noise.dtype, device=device
+            )
 
         if block_mode in ['output', 'middle']:
             self.block_x = torch.zeros(
-                (self.batch_size, self.frame_seq_length, self.num_heads*128), dtype=noise.dtype, device=device
+                (self.batch_size, self.get_seq_length(), self.num_heads*128), dtype=noise.dtype, device=device
             )
         else:
             self.block_x = None
 
         self.kv_cache_starts = torch.ones(self.batch_size, dtype=torch.long, device=device) * current_end
-        self.kv_cache_ends = torch.ones(self.batch_size, dtype=torch.long, device=device) * current_end + self.frame_seq_length
+        self.kv_cache_ends = torch.ones(self.batch_size, dtype=torch.long, device=device) * current_end + self.get_seq_length()
 
         self.timestep = self.denoising_step_list
 
@@ -239,6 +264,8 @@ class CausalStreamInferencePipeline(torch.nn.Module):
     def inference_stream(self, noise: torch.Tensor, current_start: int, current_end: int, current_step: int) -> torch.Tensor:
 
         self.hidden_states[1:] = self.hidden_states[:-1].clone()
+        print('DEBUG hidden_states[0] shape:', self.hidden_states[0].shape)
+        print('DEBUG noise[0] shape:', noise[0].shape)
         self.hidden_states[0] = noise[0]
 
         self.kv_cache_starts[1:] = self.kv_cache_starts[:-1].clone()

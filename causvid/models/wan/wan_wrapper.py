@@ -19,7 +19,7 @@ repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 
 
 class WanTextEncoder(TextEncoderInterface):
-    def __init__(self, model_type="T2V-1.3B") -> None:
+    def __init__(self) -> None:
         super().__init__()
 
         self.text_encoder = umt5_xxl(
@@ -29,7 +29,7 @@ class WanTextEncoder(TextEncoderInterface):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load(f"wan_models/Wan2.1-{model_type}/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(os.path.join(repo_root, "wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth"),
                        map_location='cpu', weights_only=False)
         )
 
@@ -57,7 +57,7 @@ class WanTextEncoder(TextEncoderInterface):
 
 
 class WanVAEWrapper(VAEInterface):
-    def __init__(self, model_type="T2V-1.3B"):
+    def __init__(self):
         super().__init__()
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -72,7 +72,7 @@ class WanVAEWrapper(VAEInterface):
 
         # init model
         self.model = _video_vae(
-            pretrained_path=f"wan_models/Wan2.1-{model_type}/Wan2.1_VAE.pth",
+            pretrained_path=os.path.join(repo_root, "wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"),
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -111,15 +111,6 @@ class WanVAEWrapper(VAEInterface):
         # output = output.permute(0, 2, 1, 3, 4)
         return output
     
-    def stream_encode(self, video: torch.Tensor, is_scale=True) -> torch.Tensor:
-        if is_scale:
-            device, dtype = video.device, video.dtype
-            scale = [self.mean.to(device=device, dtype=dtype),
-                    1.0 / self.std.to(device=device, dtype=dtype)]
-        else:
-            scale = None
-        return self.model.stream_encode(video, scale)
-    
     def stream_decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
         zs = latent.permute(0, 2, 1, 3, 4)
         zs = zs.to(torch.bfloat16).to('cuda')
@@ -132,10 +123,10 @@ class WanVAEWrapper(VAEInterface):
 
 
 class WanDiffusionWrapper(DiffusionModelInterface):
-    def __init__(self, model_type="T2V-1.3B"):
+    def __init__(self):
         super().__init__()
 
-        self.model = WanModel.from_pretrained(f"wan_models/Wan2.1-{model_type}/")
+        self.model = WanModel.from_pretrained(os.path.join(repo_root, "wan_models/Wan2.1-T2V-1.3B/"))
         self.model.eval()
 
         self.uniform_timestep = True
@@ -171,9 +162,42 @@ class WanDiffusionWrapper(DiffusionModelInterface):
                                                         self.scheduler.timesteps]
         )
 
+        # Ensure first dimension matches (batch*channel) after flattening
+        if flow_pred.shape[0] != xt.shape[0]:
+            max_dim = max(flow_pred.shape[0], xt.shape[0])
+            if flow_pred.shape[0] < max_dim:
+                repeat_factor = max_dim // flow_pred.shape[0]
+                flow_pred = flow_pred.repeat(repeat_factor, 1, 1, 1)
+            if xt.shape[0] < max_dim:
+                repeat_factor = max_dim // xt.shape[0]
+                xt = xt.repeat(repeat_factor, 1, 1, 1)
+
+
         timestep_id = torch.argmin(
             (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
         sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        print(f"[DEBUG] _convert_flow_pred_to_x0: BEFORE SUBTRACTION: flow_pred shape: {flow_pred.shape}, xt shape: {xt.shape}, sigma_t shape: {sigma_t.shape}")
+        # Final failsafe: forcibly match first dimension before subtraction
+        if flow_pred.shape[0] != xt.shape[0]:
+            max_dim = max(flow_pred.shape[0], xt.shape[0])
+            if flow_pred.shape[0] < max_dim:
+                repeat_factor = max_dim // flow_pred.shape[0]
+                flow_pred = flow_pred.repeat(repeat_factor, 1, 1, 1)
+            if xt.shape[0] < max_dim:
+                repeat_factor = max_dim // xt.shape[0]
+                xt = xt.repeat(repeat_factor, 1, 1, 1)
+        print(f"[DEBUG] _convert_flow_pred_to_x0: AFTER REPEAT: flow_pred shape: {flow_pred.shape}, xt shape: {xt.shape}, sigma_t shape: {sigma_t.shape}")
+
+        timestep_id = torch.argmin(
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        # Ensure sigma_t matches the first dimension of flow_pred and xt
+        if sigma_t.shape[0] != flow_pred.shape[0]:
+            if sigma_t.shape[0] == 1:
+                sigma_t = sigma_t.expand(flow_pred.shape[0], -1, -1, -1)
+            else:
+                sigma_t = sigma_t[:flow_pred.shape[0]]
+        print(f"[DEBUG] _convert_flow_pred_to_x0: FINAL shapes: flow_pred {flow_pred.shape}, xt {xt.shape}, sigma_t {sigma_t.shape}")
         x0_pred = xt - sigma_t * flow_pred
         return x0_pred.to(original_dtype)
 
@@ -232,9 +256,31 @@ class WanDiffusionWrapper(DiffusionModelInterface):
                 seq_len=self.seq_len
             ).permute(0, 2, 1, 3, 4)
 
+        # Ensure channel dimensions match for flow_pred and xt before flattening
+        xt = noisy_image_or_video
+        if flow_pred.shape[1] != xt.shape[1]:
+            if flow_pred.shape[1] > xt.shape[1]:
+                repeat_factor = flow_pred.shape[1] // xt.shape[1]
+                xt = xt.repeat(1, repeat_factor, 1, 1, 1)
+            elif flow_pred.shape[1] < xt.shape[1]:
+                repeat_factor = xt.shape[1] // flow_pred.shape[1]
+                flow_pred = flow_pred.repeat(1, repeat_factor, 1, 1, 1)
+        # Flatten and check shapes
+        flow_pred_flat = flow_pred.flatten(0, 1)
+        xt_flat = xt.flatten(0, 1)
+        # If still mismatched, repeat the smaller to match the larger
+        if flow_pred_flat.shape[0] != xt_flat.shape[0]:
+            max_dim = max(flow_pred_flat.shape[0], xt_flat.shape[0])
+            if flow_pred_flat.shape[0] < max_dim:
+                repeat_factor = max_dim // flow_pred_flat.shape[0]
+                flow_pred_flat = flow_pred_flat.repeat(repeat_factor, 1, 1, 1)
+            if xt_flat.shape[0] < max_dim:
+                repeat_factor = max_dim // xt_flat.shape[0]
+                xt_flat = xt_flat.repeat(repeat_factor, 1, 1, 1)
+        print(f"[DEBUG] [forward] flow_pred_flat shape: {flow_pred_flat.shape}, xt_flat shape: {xt_flat.shape}")
         pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=flow_pred.flatten(0, 1),
-            xt=noisy_image_or_video.flatten(0, 1),
+            flow_pred=flow_pred_flat,
+            xt=xt_flat,
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
 
@@ -311,9 +357,31 @@ class WanDiffusionWrapper(DiffusionModelInterface):
             patched_x_shape=patched_x_shape,
         ).permute(0, 2, 1, 3, 4)
 
+        # Ensure channel dimensions match for flow_pred and xt before flattening
+        xt = noisy_image_or_video
+        if flow_pred.shape[1] != xt.shape[1]:
+            if flow_pred.shape[1] > xt.shape[1]:
+                repeat_factor = flow_pred.shape[1] // xt.shape[1]
+                xt = xt.repeat(1, repeat_factor, 1, 1, 1)
+            elif flow_pred.shape[1] < xt.shape[1]:
+                repeat_factor = xt.shape[1] // flow_pred.shape[1]
+                flow_pred = flow_pred.repeat(1, repeat_factor, 1, 1, 1)
+        # Flatten and check shapes
+        flow_pred_flat = flow_pred.flatten(0, 1)
+        xt_flat = xt.flatten(0, 1)
+        # If still mismatched, repeat the smaller to match the larger
+        if flow_pred_flat.shape[0] != xt_flat.shape[0]:
+            max_dim = max(flow_pred_flat.shape[0], xt_flat.shape[0])
+            if flow_pred_flat.shape[0] < max_dim:
+                repeat_factor = max_dim // flow_pred_flat.shape[0]
+                flow_pred_flat = flow_pred_flat.repeat(repeat_factor, 1, 1, 1)
+            if xt_flat.shape[0] < max_dim:
+                repeat_factor = max_dim // xt_flat.shape[0]
+                xt_flat = xt_flat.repeat(repeat_factor, 1, 1, 1)
+        print(f"[DEBUG] [forward_output] flow_pred_flat shape: {flow_pred_flat.shape}, xt_flat shape: {xt_flat.shape}")
         pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=flow_pred.flatten(0, 1),
-            xt=noisy_image_or_video.flatten(0, 1),
+            flow_pred=flow_pred_flat,
+            xt=xt_flat,
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
 
@@ -321,11 +389,11 @@ class WanDiffusionWrapper(DiffusionModelInterface):
 
 
 class CausalWanDiffusionWrapper(WanDiffusionWrapper):
-    def __init__(self, model_type="T2V-1.3B"):
+    def __init__(self):
         super().__init__()
 
         self.model = CausalWanModel.from_pretrained(
-            f"wan_models/Wan2.1-{model_type}/")
+            os.path.join(repo_root, "wan_models/Wan2.1-T2V-1.3B/"))
         self.model.eval()
 
         self.uniform_timestep = False

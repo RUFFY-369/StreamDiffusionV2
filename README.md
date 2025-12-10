@@ -32,12 +32,16 @@ StreamDiffusionV2 is an open-source interactive diffusion pipeline for real-time
 
 ## Installation
 
+> **Note:** The following installation commands are updated for reliability and to avoid common build errors with PyTorch, flash_attn, and NVIDIA packages.
+
 ```shell
 conda create -n stream python=3.10.0
 conda activate stream
 # Require CUDA 12.4 or above, please check via `nvcc -V`
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt 
+pip install --no-build-isolation --no-deps flash_attn==2.7.4.post1
+# Remove nvidia-pyindex from requirements.txt if present
+pip install -r requirements.txt --no-deps
 python setup.py develop
 ```
 

@@ -76,8 +76,7 @@ class CausalWanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         
-        self.sink_size = 3
-        self.adapt_sink_thr = -1
+        self.sink_size = 0
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -87,7 +86,7 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, block_mask, kv_cache=None, current_start=0, current_end=0):
+    def forward(self, x, seq_lens, grid_sizes, freqs, block_mask, kv_cache=None, current_start=0, current_end=0, dynamic_seq_len=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -138,7 +137,9 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            # Always use the actual cache length for all cache ops
+            cache_len = kv_cache['k'].shape[1]
+            frame_seqlen = cache_len
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
@@ -146,58 +147,41 @@ class CausalWanSelfAttention(nn.Module):
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
             seq_lens = []
-            for i, c_start in enumerate(current_start):
-                current_end = c_start + roped_query.shape[1]
-                sink_tokens = self.sink_size * frame_seqlen
-                
-                if sink_tokens > 0 and self.adapt_sink_thr > -1 and v.shape[1] <= frame_seqlen:
-                    # Caculate similarity between new keys/values and the oldest ones in the cache
-                    k_sink_mean = kv_cache["k"][i:i+1, :sink_tokens].reshape(self.sink_size, frame_seqlen, -1).mean(1)
-                    k_new_mean = roped_key[i:i+1].reshape(1, frame_seqlen, -1).mean(1)
-                    k_cos_sim = torch.cosine_similarity(k_sink_mean, k_new_mean, dim=-1)
-
-                    v_sink_mean = kv_cache["v"][i:i+1, :sink_tokens].reshape(self.sink_size, frame_seqlen, -1).mean(1)
-                    v_new_mean = v[i:i+1].reshape(1, frame_seqlen, -1).mean(1)
-                    v_cos_sim = torch.cosine_similarity(v_sink_mean, v_new_mean, dim=-1).mean()
-
-                    avg_cos_sim = (k_cos_sim + v_cos_sim)/2
-                    # When the similarity is low, refresh the sink
-                    if avg_cos_sim.min() < self.adapt_sink_thr:
-                        idx = torch.argmin(avg_cos_sim)
-                        sink_tokens = idx * frame_seqlen
-
-                # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-                kv_cache_size = kv_cache["k"].shape[1]
+            for i in range(roped_key.shape[0]):
+                c_start = current_start[i] if i < len(current_start) else current_start[0]
+                current_end_i = c_start + roped_query.shape[1]
+                sink_tokens = self.sink_size * cache_len
+                kv_cache_size = cache_len
                 num_new_tokens = roped_query.shape[1]
                 if c_start + num_new_tokens >= kv_cache_size:
                     kv_cache["global_end_index"][i].fill_(c_start)
                     kv_cache["local_end_index"][i].fill_(kv_cache_size)
-                if (current_end > kv_cache["global_end_index"][i].item()) and (
+                if (current_end_i > kv_cache["global_end_index"][i].item()) and (
                         num_new_tokens + kv_cache["local_end_index"][i].item() > kv_cache_size):
-                    # Calculate the number of new tokens added in this step
-                    # Shift existing cache content left to discard oldest tokens
-                    # Clone the source slice to avoid overlapping memory error
                     num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"][i].item() - kv_cache_size
                     num_rolled_tokens = kv_cache["local_end_index"][i].item() - num_evicted_tokens - sink_tokens
                     kv_cache["k"][i:i+1, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["k"][i:i+1, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     kv_cache["v"][i:i+1, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["v"][i:i+1, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    # Insert the new keys/values at the end
-                    local_end_index = kv_cache["local_end_index"][i].item() + current_end - \
+                    local_end_index = kv_cache["local_end_index"][i].item() + current_end_i - \
                         kv_cache["global_end_index"][i].item() - num_evicted_tokens
                 else:
-                    local_end_index = kv_cache["local_end_index"][i].item() + current_end - kv_cache["global_end_index"][i].item()
+                    local_end_index = kv_cache["local_end_index"][i].item() + current_end_i - kv_cache["global_end_index"][i].item()
 
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][i:i+1, local_start_index:local_end_index] = roped_key[i:i+1]
-                kv_cache["v"][i:i+1, local_start_index:local_end_index] = v[i:i+1]
+                # Clamp indices to cache bounds
+                local_start_index = max(0, local_end_index - num_new_tokens)
+                local_end_index = min(local_end_index, kv_cache["k"].shape[1])
+                # Ensure assignment shape matches
+                assign_len = local_end_index - local_start_index
+                kv_cache["k"][i:i+1, local_start_index:local_end_index] = roped_key[i:i+1, :assign_len]
+                kv_cache["v"][i:i+1, local_start_index:local_end_index] = v[i:i+1, :assign_len]
 
                 seq_lens.append(local_end_index)
 
-                kv_cache["global_end_index"][i].fill_(current_end)
+                kv_cache["global_end_index"][i].fill_(current_end_i)
                 kv_cache["local_end_index"][i].fill_(local_end_index)
-            
+
             seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=roped_query.device)
 
             x = flash_attn_interface.flash_attn_with_kvcache(
@@ -266,7 +250,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        current_end=0
+        current_end=0,
+        **kwargs
     ):
         r"""
         Args:
@@ -287,7 +272,9 @@ class CausalWanAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
              * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, current_end)
+            freqs, block_mask, kv_cache, current_start, current_end,
+            dynamic_seq_len=kwargs.get('dynamic_seq_len', None)
+        )
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
@@ -628,7 +615,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             def custom_forward(*inputs, **kwargs):
                 return module(*inputs, **kwargs)
             return custom_forward
-        
+
         for block_index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 assert False

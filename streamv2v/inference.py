@@ -62,13 +62,15 @@ def load_mp4_as_tensor(
 
     return video  # [C, T, H, W]
 
-def compute_noise_scale_and_step(input_video_original: torch.Tensor, end_idx: int, chunck_size: int, noise_scale: float, init_noise_scale: float):
+
+def compute_noise_scale_and_step(input_video_original: torch.Tensor, end_idx: int, chunck_size: int, noise_scale: float):
     """Compute adaptive noise scale and current step based on video content."""
-    l2_dist=(input_video_original[:,:,end_idx-chunck_size:end_idx]-input_video_original[:,:,end_idx-chunck_size-1:end_idx-1])**2
+    l2_dist = (input_video_original[:,:,end_idx-chunck_size:end_idx]-input_video_original[:,:,end_idx-chunck_size-1:end_idx-1])**2
     l2_dist = (torch.sqrt(l2_dist.mean(dim=(0,1,3,4))).max()/0.2).clamp(0,1)
-    new_noise_scale = (init_noise_scale-0.1*l2_dist.item())*0.9+noise_scale*0.1
+    new_noise_scale = (0.9-0.2*l2_dist.item())*0.9+noise_scale*0.1
     current_step = int(1000*new_noise_scale)-100
     return new_noise_scale, current_step
+
 
 class SingleGPUInferencePipeline:
     """
@@ -109,7 +111,6 @@ class SingleGPUInferencePipeline:
         self.t_dit = 100.0
         self.t_total = 100.0
         self.processed = 0
-
         
         self.logger.info("Single GPU inference pipeline manager initialized")
     
@@ -186,8 +187,12 @@ class SingleGPUInferencePipeline:
         if input_video_original is not None:
             inp = input_video_original[:, :, start_idx:end_idx]
             
+            noise_scale, current_step = compute_noise_scale_and_step(
+                input_video_original, end_idx, chunck_size, noise_scale
+            )
+            
             # VAE encoding
-            latents = self.pipeline.vae.stream_encode(inp)
+            latents = self.pipeline.vae.model.stream_encode(inp)
             latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
             
             noise = torch.randn_like(latents)
@@ -211,8 +216,6 @@ class SingleGPUInferencePipeline:
         results[save_results] = video.cpu().float().numpy()
         save_results += 1
         
-        init_noise_scale = noise_scale
-        
         # Process remaining chunks
         while self.processed < num_chuncks + num_steps - 1:
             # Update indices
@@ -225,11 +228,11 @@ class SingleGPUInferencePipeline:
                 inp = input_video_original[:, :, start_idx:end_idx]
                 
                 noise_scale, current_step = compute_noise_scale_and_step(
-                    input_video_original, end_idx, chunck_size, noise_scale, init_noise_scale
+                    input_video_original, end_idx, chunck_size, noise_scale
                 )
                 
                 # VAE encoding
-                latents = self.pipeline.vae.stream_encode(inp)
+                latents = self.pipeline.vae.model.stream_encode(inp)
                 latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
                 
                 noise = torch.randn_like(latents)
@@ -289,6 +292,60 @@ class SingleGPUInferencePipeline:
         self.logger.info(f"Video saved to: {output_path}")
         
         self.logger.info("Single GPU inference pipeline completed")
+    
+    def img2img_inference(self, input_image: torch.Tensor, prompts: list, strength: float, output_path: str):
+        """
+        Run true img2img inference: single image in, single image out.
+        Args:
+            input_image: (B, C, H, W) input image tensor
+            prompts: list of text prompts
+            strength: float, noise strength (0 = no noise, 1 = full noise)
+            output_path: str, where to save output image
+        """
+        self.logger.info("Starting true img2img inference pipeline")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        # Repeat input along temporal axis to T=21 for 3D conv compatibility
+        # Debug: print input shapes
+        print('input_image shape:', input_image.shape)
+        input_seq = input_image.unsqueeze(2).repeat(1, 1, 21, 1, 1)  # (B, C, T=21, H, W)
+        print('input_seq shape:', input_seq.shape)
+        latents = self.pipeline.vae.model.stream_encode(input_seq)
+        # Repeat channel dimension if needed (6 -> 12)
+        if latents.shape[1] == 6:
+            latents = latents.repeat(1, 2, 1, 1, 1)
+        latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
+        # Apply noise
+        noise = torch.randn_like(latents)
+        noisy_latents = noise * strength + latents * (1 - strength)
+        # Ensure noisy_latents also has 12 channels
+        if noisy_latents.shape[1] == 6:
+            noisy_latents = noisy_latents.repeat(1, 2, 1, 1, 1)
+        # Debug: print latents and noisy_latents shapes
+        print('latents shape:', latents.shape)
+        print('noisy_latents shape:', noisy_latents.shape)
+        # Prepare pipeline (initialize hidden states)
+        self.prepare_pipeline(
+            text_prompts=prompts,
+            noise=noisy_latents,
+            current_start=0,
+            current_end=1
+        )
+        # Now run inference
+        denoised_pred = self.pipeline.inference_stream(
+            noise=noisy_latents,
+            current_start=0,
+            current_end=1,
+            current_step=None,
+        )
+        # VAE decode output image
+        image = self.pipeline.vae.stream_decode_to_pixel(denoised_pred)
+        image = (image * 0.5 + 0.5).clamp(0, 1)
+        image = image[0, 0].permute(1, 2, 0).contiguous()  # (H, W, C)
+        # Save as PNG
+        from torchvision.utils import save_image
+        save_image(image.permute(2, 0, 1), output_path)
+        self.logger.info(f"img2img image saved to: {output_path}")
+        return image
 
 
 def main():
@@ -299,6 +356,7 @@ def main():
     parser.add_argument("--output_folder", type=str, required=True, help="Output folder path")
     parser.add_argument("--prompt_file_path", type=str, required=True, help="Prompt file path")
     parser.add_argument("--video_path", type=str, required=False, default=None, help="Input video path")
+    parser.add_argument("--image_path", type=str, required=False, default=None, help="Input image path for img2img")
     parser.add_argument("--noise_scale", type=float, default=0.700, help="Noise scale")
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--width", type=int, default=832, help="Video width")
@@ -331,7 +389,16 @@ def main():
     else:
         config.denoising_step_list = full_denoising_list
     
-    # Load input video
+    # Load input image if provided
+    input_image = None
+    if args.image_path is not None:
+        assert os.path.exists(args.image_path), f"Image file not found: {args.image_path}"
+        input_image = torchvision.io.read_image(args.image_path).float() / 127.5 - 1.0  # [C, H, W]
+        input_image = input_image.unsqueeze(0)  # [1, C, H, W]
+        input_image = input_image.to(torch.bfloat16)
+        input_image = input_image.to(device)  # Ensure input is on CUDA
+    # Load input video if provided
+    input_video_original = None
     if args.video_path is not None:
         input_video_original = load_mp4_as_tensor(args.video_path, resize_hw=(args.height, args.width)).unsqueeze(0)
         print(f"Input video tensor shape: {input_video_original.shape}")
@@ -339,31 +406,35 @@ def main():
         if input_video_original.dtype != torch.bfloat16:
             input_video_original = input_video_original.to(dtype=torch.bfloat16).to(device)
     else:
-        input_video_original = None
         t = args.num_frames
-    
-    # Calculate number of chunks
-    chunck_size = 4
-    num_chuncks = (t - 1) // chunck_size
-    
+
     # Initialize pipeline manager
     pipeline_manager = SingleGPUInferencePipeline(config, device)
     pipeline_manager.load_model(args.checkpoint_folder)
-    
+
     # Load prompts
     dataset = TextDataset(args.prompt_file_path)
     prompts = [dataset[0]]
     num_steps = len(pipeline_manager.pipeline.denoising_step_list)
-    
-    # Run inference
-    try:
-        pipeline_manager.run_inference(
-            input_video_original, prompts, num_chuncks, chunck_size, 
-            args.noise_scale, args.output_folder, args.fps, num_steps
-        )
-    except Exception as e:
-        print(f"Error occurred during inference: {e}")
-        raise
+
+    # Run img2img or v2v inference
+    if input_image is not None:
+        output_path = os.path.join(args.output_folder, "img2img_result.png")
+        strength = args.noise_scale if hasattr(args, "noise_scale") else 0.7
+        pipeline_manager.img2img_inference(input_image, prompts, strength, output_path)
+    elif input_video_original is not None:
+        chunck_size = 4
+        num_chuncks = (t - 1) // chunck_size
+        try:
+            pipeline_manager.run_inference(
+                input_video_original, prompts, num_chuncks, chunck_size, 
+                args.noise_scale, args.output_folder, args.fps, num_steps
+            )
+        except Exception as e:
+            print(f"Error occurred during inference: {e}")
+            raise
+    else:
+        print("Error: Please provide either --image_path for img2img or --video_path for v2v inference.")
 
 
 if __name__ == "__main__":
