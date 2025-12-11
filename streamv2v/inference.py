@@ -363,8 +363,14 @@ def main():
         if input_video_original.dtype != torch.bfloat16:
             input_video_original = input_video_original.to(dtype=torch.bfloat16).to(device)
     elif args.image_path is not None:
+        min_frames = 5
+        if args.num_frames < min_frames:
+            print(f"[WARNING] num_frames for img2vid must be at least {min_frames}. Overriding to {min_frames}.")
+            num_frames = min_frames
+        else:
+            num_frames = args.num_frames
         input_video_original = load_image_as_video_tensor(
-            args.image_path, args.num_frames, resize_hw=(args.height, args.width)
+            args.image_path, num_frames, resize_hw=(args.height, args.width)
         ).unsqueeze(0)  # [1, C, T, H, W]
         print(f"Input image tensor shape: {input_video_original.shape}")
         b, c, t, h, w = input_video_original.shape
