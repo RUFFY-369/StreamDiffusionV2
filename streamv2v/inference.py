@@ -322,7 +322,7 @@ def main():
     parser.add_argument("--output_folder", type=str, required=True, help="Output folder path")
     parser.add_argument("--prompt_file_path", type=str, required=True, help="Prompt file path")
     parser.add_argument("--video_path", type=str, required=False, default=None, help="Input video path")
-    parser.add_argument("--image_path", type=str, required=False, default=None, help="Input image path for img2vid mode")
+    parser.add_argument("--image_path", type=str, required=False, default=None, help="Input image path. Defaults to img2vid mode unless --img2img is set.")
     parser.add_argument("--noise_scale", type=float, default=0.700, help="Noise scale")
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--width", type=int, default=832, help="Video width")
@@ -331,6 +331,8 @@ def main():
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type (e.g., T2V-1.3B)")
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
+    parser.add_argument("--img2img", action="store_true", default=False, help="Enable img2img mode: extract a single frame from img2vid output.")
+    parser.add_argument("--img2img_frame", type=str, default="last", choices=["first", "last", "middle"], help="Which frame to extract for img2img output.")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
@@ -399,6 +401,34 @@ def main():
             input_video_original, prompts, num_chuncks, chunck_size, 
             args.noise_scale, args.output_folder, args.fps, num_steps
         )
+        # If --img2img is set, extract a frame from the output video. Otherwise, output video is saved as usual (img2vid).
+        if args.image_path is not None and args.img2img:
+            import os
+            import numpy as np
+            import imageio
+            video_path = os.path.join(args.output_folder, f"output_{0:03d}.mp4")
+            if not os.path.exists(video_path):
+                print(f"[ERROR] Video file not found: {video_path}")
+                return
+            # Read video frames
+            vid = imageio.get_reader(video_path, 'ffmpeg')
+            frames = [frame for frame in vid]
+            vid.close()
+            if not frames:
+                print("[ERROR] No frames found in video.")
+                return
+            if args.img2img_frame == "first":
+                idx = 0
+            elif args.img2img_frame == "middle":
+                idx = len(frames) // 2
+            else:
+                idx = -1
+            img = frames[idx]
+            img2img_path = os.path.join(args.output_folder, "img2img_result.png")
+            imageio.imwrite(img2img_path, img)
+            print(f"[INFO] Saved img2img result to {img2img_path} (frame: {args.img2img_frame})")
+        elif args.image_path is not None:
+            print("[INFO] img2vid mode: output video saved. Use --img2img to extract a single frame as an image.")
     except Exception as e:
         print(f"Error occurred during inference: {e}")
         raise
