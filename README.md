@@ -60,7 +60,10 @@ We use the 14B model from [CausVid-Plus](https://github.com/GoatWu/CausVid-Plus)
 
 ## Offline Inference
 
+
 ### Single GPU
+
+#### Video-to-Video (vid2vid) Inference
 
 ```shell
 python streamv2v/inference.py \
@@ -75,6 +78,40 @@ python streamv2v/inference.py \
 --step 2
 ```
 Note: `--step` sets how many denoising steps are used during inference.
+
+#### Image-to-Video (img2vid) Inference
+
+```shell
+python streamv2v/inference.py \
+--config_path configs/wan_causal_dmd_v2v.yaml \
+--checkpoint_folder ckpts/wan_causal_dmd_v2v \
+--output_folder outputs/ \
+--prompt_file_path prompt.txt \
+--image_path first_frame.png \
+--height 480 \
+--width 832 \
+--fps 16 \
+--step 2
+```
+This will generate a video from a single image. By default, `--image_path` triggers img2vid mode.
+
+#### Image-to-Image (img2img) Inference
+
+```shell
+python streamv2v/inference.py \
+--config_path configs/wan_causal_dmd_v2v.yaml \
+--checkpoint_folder ckpts/wan_causal_dmd_v2v \
+--output_folder outputs/ \
+--prompt_file_path prompt.txt \
+--image_path first_frame.png \
+--img2img \
+--img2img_frame last \
+--height 480 \
+--width 832 \
+--fps 16 \
+--step 2
+```
+This will generate a single image from the input image, using the video pipeline and extracting the specified frame (`first`, `middle`, or `last`).
 
 ### Multi-GPU
 
