@@ -91,7 +91,8 @@ python streamv2v/inference.py \
 --height 480 \
 --width 832 \
 --fps 16 \
---step 2
+--step 2 \
+--num_frames 5
 ```
 This will generate a video from a single image. By default, `--image_path` triggers img2vid mode.
 
@@ -105,13 +106,13 @@ python streamv2v/inference.py \
 --prompt_file_path prompt.txt \
 --image_path first_frame.png \
 --img2img \
---img2img_frame last \
 --height 480 \
 --width 832 \
 --fps 16 \
---step 2
+--step 2 \
+--num_frames 5
 ```
-This will generate a single image from the input image, using the video pipeline and extracting the specified frame (`first`, `middle`, or `last`).
+This will generate a single image from the input image, using the video pipeline and extracting the frame.
 
 ### Multi-GPU
 

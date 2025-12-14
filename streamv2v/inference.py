@@ -8,6 +8,7 @@ inference pipeline on a single GPU:
 3. VAE decode output video
 """
 
+
 from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
 from diffusers.utils import export_to_video
 from causvid.data import TextDataset
@@ -18,7 +19,7 @@ import os
 import time
 import numpy as np
 import logging
-
+from PIL import Image
 import torchvision
 import torchvision.transforms.functional as TF
 from einops import rearrange
@@ -332,14 +333,17 @@ def main():
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--img2img", action="store_true", default=False, help="Enable img2img mode: extract a single frame from img2vid output.")
-    parser.add_argument("--img2img_frame", type=str, default="last", choices=["first", "last", "middle"], help="Which frame to extract for img2img output.")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
-    
+
+    import time
+    # Global timing start
+    global_start_time = time.time()
+
     # Auto-detect device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Load configuration
     config = OmegaConf.load(args.config_path)
     config = OmegaConf.merge(config, OmegaConf.create(vars(args)))
@@ -356,7 +360,7 @@ def main():
         config.denoising_step_list = [700, 600, 400, 0]
     else:
         config.denoising_step_list = full_denoising_list
-    
+
     # Load input video or image
     if args.video_path is not None:
         input_video_original = load_mp4_as_tensor(args.video_path, resize_hw=(args.height, args.width)).unsqueeze(0)
@@ -381,57 +385,87 @@ def main():
     else:
         input_video_original = None
         t = args.num_frames
-    
-    # Calculate number of chunks
-    chunck_size = 4
-    num_chuncks = (t - 1) // chunck_size
-    
-    # Initialize pipeline manager
-    pipeline_manager = SingleGPUInferencePipeline(config, device)
-    pipeline_manager.load_model(args.checkpoint_folder)
-    
-    # Load prompts
-    dataset = TextDataset(args.prompt_file_path)
-    prompts = [dataset[0]]
-    num_steps = len(pipeline_manager.pipeline.denoising_step_list)
-    
-    # Run inference
-    try:
-        pipeline_manager.run_inference(
-            input_video_original, prompts, num_chuncks, chunck_size, 
-            args.noise_scale, args.output_folder, args.fps, num_steps
+
+    # Optimized img2img path
+    if args.image_path is not None and args.img2img:
+        import os
+        import numpy as np
+        import imageio
+        # --- Fast img2img: skip chunking, cache, and video logic ---
+        pipeline_manager = SingleGPUInferencePipeline(config, device)
+        pipeline_manager.load_model(args.checkpoint_folder)
+        dataset = TextDataset(args.prompt_file_path)
+        prompts = [dataset[0]]
+        # Use minimal denoising steps for speed
+        config.denoising_step_list = [700, 0]
+        inp = input_video_original
+        # --- Detailed timing for each step ---
+        torch.cuda.synchronize()
+        t0 = time.time()
+        latents = pipeline_manager.pipeline.vae.stream_encode(inp)
+        torch.cuda.synchronize()
+        t1 = time.time()
+        latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
+        noise = torch.randn_like(latents)
+        noise_scale = args.noise_scale
+        noisy_latents = noise * noise_scale + latents * (1 - noise_scale)
+        t2 = time.time()
+        denoised_pred = pipeline_manager.pipeline.prepare(
+            text_prompts=prompts,
+            device=device,
+            dtype=torch.bfloat16,
+            block_mode='input',
+            noise=noisy_latents,
+            current_start=0,
+            current_end=latents.shape[1]*2
         )
-        # If --img2img is set, extract a frame from the output video. Otherwise, output video is saved as usual (img2vid).
-        if args.image_path is not None and args.img2img:
-            import os
-            import numpy as np
-            import imageio
-            video_path = os.path.join(args.output_folder, f"output_{0:03d}.mp4")
-            if not os.path.exists(video_path):
-                print(f"[ERROR] Video file not found: {video_path}")
-                return
-            # Read video frames
-            vid = imageio.get_reader(video_path, 'ffmpeg')
-            frames = [frame for frame in vid]
-            vid.close()
-            if not frames:
-                print("[ERROR] No frames found in video.")
-                return
-            if args.img2img_frame == "first":
-                idx = 0
-            elif args.img2img_frame == "middle":
-                idx = len(frames) // 2
-            else:
-                idx = -1
-            img = frames[idx]
-            img2img_path = os.path.join(args.output_folder, "img2img_result.png")
-            imageio.imwrite(img2img_path, img)
-            print(f"[INFO] Saved img2img result to {img2img_path} (frame: {args.img2img_frame})")
-        elif args.image_path is not None:
-            print("[INFO] img2vid mode: output video saved. Use --img2img to extract a single frame as an image.")
-    except Exception as e:
-        print(f"Error occurred during inference: {e}")
-        raise
+        torch.cuda.synchronize()
+        t3 = time.time()
+        image = pipeline_manager.pipeline.vae.stream_decode_to_pixel(denoised_pred)
+        torch.cuda.synchronize()
+        t4 = time.time()
+        elapsed = t4 - t0
+        fps = 1.0 / elapsed if elapsed > 0 else float('inf')
+        # --- End timing after decode ---
+        image = (image * 0.5 + 0.5).clamp(0, 1)
+        image = image[0, 0].permute(1, 2, 0).cpu().float().numpy()  # [H, W, C]
+        from PIL import Image
+        img2img_path = os.path.join(args.output_folder, "img2img_result.png")
+        Image.fromarray((image * 255).astype(np.uint8)).save(img2img_path)
+        print(f"[INFO] Fast img2img: saved result to {img2img_path}")
+        print(f"[INFO] Fast img2img: total time: {elapsed:.4f} s, FPS: {fps:.4f}")
+        print(f"[PROFILE] VAE encode: {t1-t0:.4f} s | Noise+prep: {t2-t1:.4f} s | Pipeline prepare: {t3-t2:.4f} s | VAE decode: {t4-t3:.4f} s")
+        # Global timing end for img2img
+        global_end_time = time.time()
+        total_elapsed = global_end_time - global_start_time
+        print(f"[GLOBAL] Total runtime (img2img): {total_elapsed:.4f} s")
+    else:
+        # Default: video or img2vid path
+        chunck_size = 4
+        num_chuncks = (t - 1) // chunck_size
+        pipeline_manager = SingleGPUInferencePipeline(config, device)
+        pipeline_manager.load_model(args.checkpoint_folder)
+        dataset = TextDataset(args.prompt_file_path)
+        prompts = [dataset[0]]
+        num_steps = len(pipeline_manager.pipeline.denoising_step_list)
+        try:
+            pipeline_manager.run_inference(
+                input_video_original, prompts, num_chuncks, chunck_size, 
+                args.noise_scale, args.output_folder, args.fps, num_steps
+            )
+            # Global timing end for video
+            global_end_time = time.time()
+            total_elapsed = global_end_time - global_start_time
+            # Try to get total frames for FPS
+            try:
+                total_frames = t if input_video_original is not None else 0
+                avg_fps = total_frames / total_elapsed if total_elapsed > 0 else float('inf')
+                print(f"[GLOBAL] Total runtime (video): {total_elapsed:.4f} s, Avg FPS: {avg_fps:.4f}")
+            except Exception as e:
+                print(f"[GLOBAL] Total runtime (video): {total_elapsed:.4f} s")
+        except Exception as e:
+            print(f"Error occurred during inference: {e}")
+            raise
 
 
 if __name__ == "__main__":
