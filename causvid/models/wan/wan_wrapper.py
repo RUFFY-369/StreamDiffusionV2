@@ -28,13 +28,16 @@ class WanTextEncoder(TextEncoderInterface):
             dtype=torch.float32,
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
+        # Absolute path for t5 weights
+        t5_weights_path = os.path.abspath(os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/models_t5_umt5-xxl-enc-bf16.pth"))
         self.text_encoder.load_state_dict(
-            torch.load(f"wan_models/Wan2.1-{model_type}/models_t5_umt5-xxl-enc-bf16.pth",
-                       map_location='cpu', weights_only=False)
+            torch.load(t5_weights_path, map_location='cpu', weights_only=False)
         )
 
+        # Absolute path for tokenizer directory
+        tokenizer_dir = os.path.abspath(os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/google/umt5-xxl/"))
         self.tokenizer = HuggingfaceTokenizer(
-            name=os.path.join(repo_root, "wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/"), seq_len=512, clean='whitespace')
+            name=tokenizer_dir, seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -70,9 +73,10 @@ class WanVAEWrapper(VAEInterface):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
-        # init model
+        # Absolute path for VAE weights
+        vae_weights_path = os.path.abspath(os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/Wan2.1_VAE.pth"))
         self.model = _video_vae(
-            pretrained_path=f"wan_models/Wan2.1-{model_type}/Wan2.1_VAE.pth",
+            pretrained_path=vae_weights_path,
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -135,7 +139,9 @@ class WanDiffusionWrapper(DiffusionModelInterface):
     def __init__(self, model_type="T2V-1.3B"):
         super().__init__()
 
-        self.model = WanModel.from_pretrained(f"wan_models/Wan2.1-{model_type}/")
+        import os
+        model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../wan_models/Wan2.1-{}".format(model_type)))
+        self.model = WanModel.from_pretrained(model_dir)
         self.model.eval()
 
         self.uniform_timestep = True
@@ -324,8 +330,9 @@ class CausalWanDiffusionWrapper(WanDiffusionWrapper):
     def __init__(self, model_type="T2V-1.3B"):
         super().__init__()
 
-        self.model = CausalWanModel.from_pretrained(
-            f"wan_models/Wan2.1-{model_type}/")
+        import os
+        model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../wan_models/Wan2.1-{}".format(model_type)))
+        self.model = CausalWanModel.from_pretrained(model_dir)
         self.model.eval()
 
         self.uniform_timestep = False
