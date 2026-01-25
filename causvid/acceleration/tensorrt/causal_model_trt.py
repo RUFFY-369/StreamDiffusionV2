@@ -251,24 +251,23 @@ class CausalWanModelTRTExport(nn.Module):
     @classmethod
     def from_pretrained_model(cls, original_model) -> 'CausalWanModelTRTExport':
         """Create TRT-exportable model from pretrained CausalWanModel."""
-        config = original_model.config
-        
+        # Access attributes directly from model (not from config dict)
         trt_model = cls(
-            model_type=config.model_type,
-            patch_size=config.patch_size,
-            text_len=config.text_len,
-            in_dim=config.in_dim,
-            dim=config.dim,
-            ffn_dim=config.ffn_dim,
-            freq_dim=config.freq_dim,
-            text_dim=config.text_dim,
-            out_dim=config.out_dim,
-            num_heads=config.num_heads,
-            num_layers=config.num_layers,
-            window_size=config.window_size,
-            qk_norm=config.qk_norm,
-            cross_attn_norm=config.cross_attn_norm,
-            eps=config.eps,
+            model_type=original_model.model_type,
+            patch_size=original_model.patch_size,
+            text_len=original_model.text_len,
+            in_dim=original_model.in_dim,
+            dim=original_model.dim,
+            ffn_dim=original_model.ffn_dim,
+            freq_dim=original_model.freq_dim,
+            text_dim=original_model.text_dim,
+            out_dim=original_model.out_dim,
+            num_heads=original_model.num_heads,
+            num_layers=original_model.num_layers,
+            window_size=original_model.window_size,
+            qk_norm=original_model.qk_norm,
+            cross_attn_norm=original_model.cross_attn_norm,
+            eps=original_model.eps,
         )
         
         # Copy weights from original model
@@ -319,6 +318,70 @@ class CausalWanModelTRTExport(nn.Module):
             trt_model.img_emb.load_state_dict(original_model.img_emb.state_dict())
         
         return trt_model
+    
+    def forward_export(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Simplified forward for ONNX export (no KV cache).
+        
+        This version runs a single forward pass without caching,
+        suitable for exporting the core model to ONNX/TensorRT.
+        The KV cache logic will be handled in the C++ runtime wrapper.
+        
+        Args:
+            x: [B, F, C, H, W] noisy latents
+            timestep: [B, F] timesteps
+            context: [B, text_len, text_dim] text embeddings (raw, not embedded)
+            grid_sizes: [B, 3] containing (F, H, W)
+        
+        Returns:
+            output: [B, C, F', H', W'] denoised prediction
+        """
+        device = x.device
+        dtype = x.dtype
+        b = x.shape[0]
+        
+        # Embed context (text) - ensure dtype matches
+        context_emb = self.text_embedding(context.to(dtype))  # [B, text_len, dim]
+        
+        # Embed patches: [B, F, C, H, W] -> [B, dim, F', H', W'] -> [B, L, dim]
+        x = self.patch_embedding(x.permute(0, 2, 1, 3, 4))  # [B, C, F, H, W]
+        x = x.flatten(2).transpose(1, 2)  # [B, L, dim]
+        
+        seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
+        
+        # Time embeddings - cast sinusoidal output to model dtype
+        from causvid.models.wan.wan_base.modules.model import sinusoidal_embedding_1d
+        sin_emb = sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).to(dtype)
+        t_emb = self.time_embedding(sin_emb)
+        e = self.time_projection(t_emb).unflatten(1, (6, self.dim))
+        e = e.unflatten(0, timestep.shape)  # [B, F, 6, dim]
+        
+        # Process through blocks (no caching for export)
+        for block in self.blocks:
+            x, _, _, _, _ = block(
+                x, e, seq_lens, grid_sizes, self.freqs, context_emb, None,
+                None, None, None, None, None, None, None, None
+            )
+        
+        # Head
+        num_frames = e.shape[1]
+        frame_seqlen = x.shape[1] // num_frames
+        e_head = t_emb.unflatten(0, timestep.shape).unsqueeze(2)  # [B, F, 1, dim]
+        e_mod = (self.head_modulation.unsqueeze(1) + e_head).chunk(2, dim=2)
+        
+        x = self.head_norm(x).unflatten(1, (num_frames, frame_seqlen))
+        x = self.head_linear(x * (1 + e_mod[1]) + e_mod[0])
+        
+        # Unpatchify
+        x = self._unpatchify(x, grid_sizes)
+        
+        return x
     
     def forward(
         self,

@@ -66,41 +66,55 @@ def trt_rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tenso
     """
     Apply rotary position embeddings - TensorRT compatible version.
     
+    Uses real-number operations (sin/cos rotation) instead of complex multiplication
+    for ONNX compatibility.
+    
     Args:
         x: [B, L, num_heads, head_dim]
         grid_sizes: [B, 3] containing (F, H, W)
-        freqs: [max_seq, head_dim // 2]
+        freqs: [max_seq, head_dim // 2] - the cos/sin frequencies
     
     Returns:
         Tensor with RoPE applied, same shape as input
     """
     b, seq_len, n, d = x.shape
-    c = d // 2
+    half_d = d // 2
     
-    # Split freqs for F, H, W dimensions
-    freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Split freqs for F, H, W dimensions  
+    freq_splits = [half_d - 2 * (half_d // 3), half_d // 3, half_d // 3]
+    freqs_split = freqs.split(freq_splits, dim=1)
     
     output = []
     for i in range(b):
         f, h, w = grid_sizes[i].tolist()
         actual_seq_len = int(f * h * w)
         
-        # Get the relevant portion
-        x_i = x[i, :actual_seq_len].to(torch.float32)
+        # Get the relevant portion and convert to float32 for precision
+        x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
         # Build frequency tensor for this sample
         freqs_f = freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
         freqs_h = freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
         freqs_w = freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)
+        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)  # [seq, 1, half_d]
         
-        # Apply rotary embeddings
-        x_complex = torch.view_as_complex(x_i.reshape(actual_seq_len, n, -1, 2))
-        x_rotated = torch.view_as_real(x_complex * freqs_i).flatten(2)
+        # Real-number rotary embedding (avoid complex numbers for ONNX)
+        # Split x into two halves for rotation
+        x_1, x_2 = x_i[..., :half_d], x_i[..., half_d:]  # [seq, n, half_d] each
+        
+        # Get cos and sin of frequencies
+        cos_freqs = freqs_i.cos().expand(-1, n, -1)  # [seq, n, half_d]
+        sin_freqs = freqs_i.sin().expand(-1, n, -1)  # [seq, n, half_d]
+        
+        # Apply rotation: [x1, x2] -> [x1*cos - x2*sin, x1*sin + x2*cos]
+        x_rotated_1 = x_1 * cos_freqs - x_2 * sin_freqs
+        x_rotated_2 = x_1 * sin_freqs + x_2 * cos_freqs
+        
+        x_rotated = torch.cat([x_rotated_1, x_rotated_2], dim=-1)  # [seq, n, d]
         
         # Handle padding
         if actual_seq_len < seq_len:
-            x_rotated = torch.cat([x_rotated, x[i, actual_seq_len:]], dim=0)
+            x_rotated = torch.cat([x_rotated, x[i, actual_seq_len:].float()], dim=0)
         
         output.append(x_rotated)
     
@@ -116,6 +130,9 @@ def trt_causal_rope_apply(
     """
     Apply rotary position embeddings for causal streaming inference.
     
+    Uses real-number operations (sin/cos rotation) instead of complex multiplication
+    for ONNX compatibility.
+    
     Args:
         x: [B, L, num_heads, head_dim]
         grid_sizes: [B, 3] containing (F, H, W)  
@@ -126,9 +143,10 @@ def trt_causal_rope_apply(
         Tensor with RoPE applied
     """
     b, seq_len, n, d = x.shape
-    c = d // 2
+    half_d = d // 2
     
-    freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freq_splits = [half_d - 2 * (half_d // 3), half_d // 3, half_d // 3]
+    freqs_split = freqs.split(freq_splits, dim=1)
     
     output = []
     for i in range(b):
@@ -136,19 +154,27 @@ def trt_causal_rope_apply(
         actual_seq_len = int(f * h * w)
         sf = int(start_frame[i].item()) if isinstance(start_frame, torch.Tensor) else int(start_frame)
         
-        x_i = x[i, :actual_seq_len].to(torch.float32)
+        x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
         # Build frequency tensor with offset
         freqs_f = freqs_split[0][sf:sf + f].view(f, 1, 1, -1).expand(f, h, w, -1)
         freqs_h = freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
         freqs_w = freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)
+        freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)  # [seq, 1, half_d]
         
-        x_complex = torch.view_as_complex(x_i.reshape(actual_seq_len, n, -1, 2))
-        x_rotated = torch.view_as_real(x_complex * freqs_i).flatten(2)
+        # Real-number rotary embedding (avoid complex numbers for ONNX)
+        x_1, x_2 = x_i[..., :half_d], x_i[..., half_d:]  # [seq, n, half_d] each
+        
+        cos_freqs = freqs_i.cos().expand(-1, n, -1)
+        sin_freqs = freqs_i.sin().expand(-1, n, -1)
+        
+        x_rotated_1 = x_1 * cos_freqs - x_2 * sin_freqs
+        x_rotated_2 = x_1 * sin_freqs + x_2 * cos_freqs
+        
+        x_rotated = torch.cat([x_rotated_1, x_rotated_2], dim=-1)  # [seq, n, d]
         
         if actual_seq_len < seq_len:
-            x_rotated = torch.cat([x_rotated, x[i, actual_seq_len:]], dim=0)
+            x_rotated = torch.cat([x_rotated, x[i, actual_seq_len:].float()], dim=0)
         
         output.append(x_rotated)
     

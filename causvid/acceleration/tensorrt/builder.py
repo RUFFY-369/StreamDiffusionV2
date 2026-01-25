@@ -99,33 +99,91 @@ class EngineBuilder:
         trt_model = CausalWanModelTRTExport.from_pretrained_model(original_model)
         trt_model.eval().to(self.device)
         
-        # Model definition for profiles
+        # Convert to fp16 if specified
+        if self.fp16:
+            trt_model = trt_model.half()
+        
+        # Create export wrapper that calls forward_export (simpler, no KV cache lists)
+        class DiTExportWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+            
+            def forward(self, x, timestep, context, grid_sizes):
+                return self.model.forward_export(x, timestep, context, grid_sizes)
+        
+        export_model = DiTExportWrapper(trt_model).eval()
+        
+        # Model definition for profiles (simplified without caches)
         model_def = CausalWanModelTRT(
             model_type=self.model_type,
             fp16=self.fp16,
             device=self.device,
         )
         
-        # Get sample inputs
-        sample_inputs = model_def.get_sample_input(batch_size, height, width, num_frames)
+        # Get simplified sample inputs (without caches)
+        lat_h, lat_w = height // 8, width // 8
+        dtype = torch.float16 if self.fp16 else torch.float32
+        
+        sample_inputs = {
+            "x": torch.randn(batch_size, num_frames, 16, lat_h, lat_w, device=self.device, dtype=dtype),
+            "timestep": torch.randint(0, 1000, (batch_size, num_frames), device=self.device),
+            "context": torch.randn(batch_size, 512, 4096, device=self.device, dtype=dtype),
+            "grid_sizes": torch.tensor([[num_frames, lat_h // 2, lat_w // 2]] * batch_size, device=self.device, dtype=torch.long),
+        }
+        
+        # Simplified input/output names
+        input_names = ["x", "timestep", "context", "grid_sizes"]
+        output_names = ["output"]
+        
+        # Dynamic axes for variable batch and resolution
+        dynamic_axes = {
+            "x": {0: "batch", 1: "frames", 3: "height", 4: "width"},
+            "timestep": {0: "batch", 1: "frames"},
+            "context": {0: "batch"},
+            "grid_sizes": {0: "batch"},
+            "output": {0: "batch", 2: "frames", 3: "height", 4: "width"},
+        }
         
         # Export to ONNX
         onnx_path = str(self._get_onnx_path(component))
         export_onnx(
-            trt_model,
+            export_model,
             onnx_path,
             tuple(sample_inputs.values()),
-            input_names=model_def.get_input_names(),
-            output_names=model_def.get_output_names(),
-            dynamic_axes=model_def.get_dynamic_axes(),
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
         )
         
         # Optimize ONNX
         onnx_opt_path = str(self._get_onnx_opt_path(component))
         optimize_onnx(onnx_path, onnx_opt_path)
         
-        # Build TensorRT engine
-        input_profile = model_def.get_input_profile(batch_size, height, width, num_frames)
+        # Build TensorRT engine with simplified profiles
+        input_profile = {
+            "x": (
+                (1, 1, 16, lat_h // 2, lat_w // 2),  # min
+                (batch_size, num_frames // 2, 16, lat_h, lat_w),  # opt
+                (batch_size * 2, num_frames * 2, 16, lat_h * 2, lat_w * 2),  # max
+            ),
+            "timestep": (
+                (1, 1),
+                (batch_size, num_frames // 2),
+                (batch_size * 2, num_frames * 2),
+            ),
+            "context": (
+                (1, 512, 4096),
+                (batch_size, 512, 4096),
+                (batch_size * 2, 512, 4096),
+            ),
+            "grid_sizes": (
+                (1, 3),
+                (batch_size, 3),
+                (batch_size * 2, 3),
+            ),
+        }
+        
         engine = build_engine(
             str(engine_path),
             onnx_opt_path,
@@ -134,7 +192,7 @@ class EngineBuilder:
         )
         
         # Cleanup
-        del trt_model, sample_inputs
+        del trt_model, export_model, sample_inputs
         gc.collect()
         torch.cuda.empty_cache()
         

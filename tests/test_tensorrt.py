@@ -49,15 +49,16 @@ class TestTRTAttention(unittest.TestCase):
         batch_size = 1
         seq_len = 1560
         
-        attn = TRTCausalSelfAttention(dim=dim, num_heads=num_heads).to(self.device)
+        # Move to device AND convert to correct dtype
+        attn = TRTCausalSelfAttention(dim=dim, num_heads=num_heads).to(self.device).to(self.dtype)
         
         x = torch.randn(batch_size, seq_len, dim, device=self.device, dtype=self.dtype)
         seq_lens = torch.tensor([seq_len], device=self.device)
         grid_sizes = torch.tensor([[1, 30, 52]], device=self.device)
         
-        # Create dummy freqs
+        # Create dummy freqs - also needs to be same dtype
         head_dim = dim // num_heads
-        freqs = torch.randn(1024, head_dim // 2, device=self.device)
+        freqs = torch.randn(1024, head_dim // 2, device=self.device, dtype=self.dtype)
         
         out, kv_k, kv_v = attn(x, seq_lens, grid_sizes, freqs)
         
