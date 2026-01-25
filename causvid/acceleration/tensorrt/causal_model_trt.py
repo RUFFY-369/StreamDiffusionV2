@@ -21,9 +21,32 @@ from causvid.models.wan.wan_base.modules.model import (
     Head,
     MLPProj,
     sinusoidal_embedding_1d,
-    rope_params,
+    # Note: NOT importing rope_params - using our own real-number version
 )
 from .attention import TRTCausalSelfAttention, TRTCrossAttention, trt_rope_apply
+
+
+def trt_rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> torch.Tensor:
+    """
+    Generate RoPE frequency parameters (real-number version for ONNX).
+    
+    Unlike the original rope_params which returns complex tensors via torch.polar,
+    this version returns real-number frequencies that work with ONNX export.
+    
+    Args:
+        max_seq_len: Maximum sequence length
+        dim: Dimension for frequencies (head_dim // 2)
+        theta: Base frequency
+    
+    Returns:
+        Tensor of shape [max_seq_len, dim] containing frequency angles (not complex)
+    """
+    assert dim % 2 == 0
+    freqs = torch.outer(
+        torch.arange(max_seq_len).float(),
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).float().div(dim))
+    )
+    return freqs  # Real-valued angles, NOT complex via torch.polar
 
 
 class TRTCrossAttentionT2V(nn.Module):
@@ -237,12 +260,12 @@ class CausalWanModelTRTExport(nn.Module):
         self.head_linear = nn.Linear(dim, math.prod(patch_size) * out_dim)
         self.head_modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
         
-        # RoPE frequencies
+        # RoPE frequencies (real-valued for ONNX compatibility)
         d = dim // num_heads
         self.register_buffer('freqs', torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
+            trt_rope_params(1024, d - 4 * (d // 6)),
+            trt_rope_params(1024, 2 * (d // 6)),
+            trt_rope_params(1024, 2 * (d // 6))
         ], dim=1))
         
         if model_type == 'i2v':
@@ -311,8 +334,10 @@ class CausalWanModelTRTExport(nn.Module):
         trt_model.head_linear.load_state_dict(original_model.head.head.state_dict())
         trt_model.head_modulation.data.copy_(original_model.head.modulation.data)
         
-        # Copy RoPE frequencies
-        trt_model.freqs.copy_(original_model.freqs)
+        # Note: NOT copying original freqs because:
+        # - Original uses complex tensors (via torch.polar) 
+        # - Our trt_rope_params generates real-valued freqs for ONNX compatibility
+        # The freqs are already initialized correctly in __init__
         
         if hasattr(original_model, 'img_emb'):
             trt_model.img_emb.load_state_dict(original_model.img_emb.state_dict())
