@@ -177,16 +177,19 @@ class EngineBuilder:
         
         # Build TensorRT engine with simplified profiles
         # Note: grid_sizes is folded as constant during ONNX tracing, so only x, timestep, context are inputs
+        # Use max(1, ...) to ensure MIN <= OPT <= MAX even with small frame counts
+        opt_frames = max(1, num_frames)
+        max_frames = max(2, num_frames * 2)
         input_profile = {
             "x": (
                 (1, 1, 16, lat_h // 2, lat_w // 2),  # min
-                (batch_size, num_frames // 2, 16, lat_h, lat_w),  # opt
-                (batch_size * 2, num_frames * 2, 16, lat_h * 2, lat_w * 2),  # max
+                (batch_size, opt_frames, 16, lat_h, lat_w),  # opt
+                (batch_size * 2, max_frames, 16, lat_h * 2, lat_w * 2),  # max
             ),
             "timestep": (
                 (1, 1),
-                (batch_size, num_frames // 2),
-                (batch_size * 2, num_frames * 2),
+                (batch_size, opt_frames),
+                (batch_size * 2, max_frames),
             ),
             "context": (
                 (1, 512, 4096),
