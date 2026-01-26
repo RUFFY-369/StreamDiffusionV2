@@ -109,6 +109,11 @@ def parse_args():
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--skip_onnx_optimize",
+        action="store_true",
+        help="Skip ONNX optimization step (saves RAM, TensorRT handles optimization)",
+    )
     return parser.parse_args()
 
 
@@ -197,6 +202,7 @@ def main():
             height=args.height,
             width=args.width,
             num_frames=args.num_frames,
+            skip_onnx_optimize=args.skip_onnx_optimize,
         )
         
         logger.info("\nBuilt engines:")

@@ -69,6 +69,7 @@ class EngineBuilder:
         height: int = 480,
         width: int = 832,
         num_frames: int = 21,
+        skip_onnx_optimize: bool = False,
     ) -> Optional[Engine]:
         """
         Build TensorRT engine for DiT model.
@@ -97,6 +98,15 @@ class EngineBuilder:
         
         original_model = pipeline.generator.model
         trt_model = CausalWanModelTRTExport.from_pretrained_model(original_model)
+        
+        # CRITICAL: Delete original model to free GPU memory before export
+        # The ONNX export needs a lot of memory for intermediate tensors
+        del original_model
+        pipeline.generator.model = None  # Prevent access to deleted model
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("Freed original model memory for ONNX export")
+        
         trt_model.eval().to(self.device)
         
         # Convert to fp16 if specified
@@ -145,7 +155,7 @@ class EngineBuilder:
             "output": {0: "batch", 2: "frames", 3: "height", 4: "width"},
         }
         
-        # Export to ONNX
+        # Export to ONNX - use dynamo_export for memory efficiency
         onnx_path = str(self._get_onnx_path(component))
         export_onnx(
             export_model,
@@ -154,13 +164,19 @@ class EngineBuilder:
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
+            use_dynamo=True,  # More memory efficient
         )
         
-        # Optimize ONNX
-        onnx_opt_path = str(self._get_onnx_opt_path(component))
-        optimize_onnx(onnx_path, onnx_opt_path)
+        # Optimize ONNX (optional - skip to save RAM)
+        if skip_onnx_optimize:
+            logger.info("Skipping ONNX optimization (--skip_onnx_optimize)")
+            onnx_opt_path = onnx_path  # Use unoptimized ONNX
+        else:
+            onnx_opt_path = str(self._get_onnx_opt_path(component))
+            optimize_onnx(onnx_path, onnx_opt_path)
         
         # Build TensorRT engine with simplified profiles
+        # Note: grid_sizes is folded as constant during ONNX tracing, so only x, timestep, context are inputs
         input_profile = {
             "x": (
                 (1, 1, 16, lat_h // 2, lat_w // 2),  # min
@@ -177,11 +193,7 @@ class EngineBuilder:
                 (batch_size, 512, 4096),
                 (batch_size * 2, 512, 4096),
             ),
-            "grid_sizes": (
-                (1, 3),
-                (batch_size, 3),
-                (batch_size * 2, 3),
-            ),
+            # grid_sizes is folded as constant during ONNX export (not a dynamic input)
         }
         
         engine = build_engine(
@@ -371,6 +383,7 @@ class EngineBuilder:
         height: int = 480,
         width: int = 832,
         num_frames: int = 21,
+        skip_onnx_optimize: bool = False,
     ) -> Dict[str, Path]:
         """
         Build all TensorRT engines.
@@ -381,6 +394,7 @@ class EngineBuilder:
             height: Video height
             width: Video width
             num_frames: Number of frames
+            skip_onnx_optimize: Skip ONNX optimization step
         
         Returns:
             Dictionary of component name -> engine path
@@ -390,19 +404,29 @@ class EngineBuilder:
         
         engines = {}
         
-        # Build DiT
-        self.build_dit(pipeline, batch_size, height, width, num_frames)
+        # Free up memory by deleting unused pipeline components before DiT export
+        # DiT export is the most memory-intensive
+        vae = pipeline.vae  # Save reference
+        text_encoder = pipeline.text_encoder  # Save reference
+        
+        # Clear any cached tensors
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Build DiT first (most memory intensive)
+        self.build_dit(pipeline, batch_size, height, width, num_frames, skip_onnx_optimize)
         engines["dit"] = self._get_engine_path("dit")
         
         # Build VAE
-        self.build_vae_encoder(pipeline.vae, batch_size, height, width, num_frames)
-        self.build_vae_decoder(pipeline.vae, batch_size, height, width, num_frames)
+        self.build_vae_encoder(vae, batch_size, height, width, num_frames)
+        self.build_vae_decoder(vae, batch_size, height, width, num_frames)
         engines["vae_encoder"] = self._get_engine_path("vae_encoder")
         engines["vae_decoder"] = self._get_engine_path("vae_decoder")
         
         # Build T5
-        self.build_t5_encoder(pipeline.text_encoder, batch_size)
+        self.build_t5_encoder(text_encoder, batch_size)
         engines["t5_encoder"] = self._get_engine_path("t5_encoder")
         
         logger.info("All TensorRT engines built successfully!")
+        return engines
         return engines

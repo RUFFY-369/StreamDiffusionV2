@@ -318,6 +318,7 @@ def export_onnx(
     output_names: List[str],
     dynamic_axes: Optional[Dict] = None,
     opset_version: int = 17,
+    use_dynamo: bool = False,
 ):
     """
     Export PyTorch model to ONNX.
@@ -330,12 +331,36 @@ def export_onnx(
         output_names: Names for outputs
         dynamic_axes: Dynamic axis specifications
         opset_version: ONNX opset version
+        use_dynamo: Use torch.onnx.dynamo_export (more memory efficient)
     """
     logger.info(f"Exporting model to ONNX: {onnx_path}")
     
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     
-    with torch.inference_mode(), torch.autocast("cuda"):
+    # Force garbage collection before export
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    if use_dynamo:
+        # PyTorch 2.x dynamo export - more memory efficient
+        try:
+            logger.info("Using torch.onnx.dynamo_export (memory efficient)")
+            export_output = torch.onnx.dynamo_export(
+                model,
+                *sample_inputs,
+            )
+            export_output.save(onnx_path)
+            logger.info(f"Dynamo export successful: {onnx_path}")
+            return
+        except Exception as e:
+            logger.warning(f"Dynamo export failed: {e}, falling back to classic export")
+    
+    # Classic export with memory optimizations
+    with torch.inference_mode():
+        # Disable gradient tracking completely
+        for param in model.parameters():
+            param.requires_grad = False
+        
         torch.onnx.export(
             model,
             sample_inputs,
