@@ -245,6 +245,8 @@ class EngineBuilder:
                 return mu
         
         encoder = VAEEncoderWrapper(vae_model).eval().to(self.device)
+        if self.fp16:
+            encoder = encoder.half()
         
         model_def = VAEEncoderTRT(fp16=self.fp16, device=self.device)
         sample_inputs = model_def.get_sample_input(batch_size, height, width, num_frames)
@@ -301,6 +303,8 @@ class EngineBuilder:
                 return self.decoder(x)
         
         decoder = VAEDecoderWrapper(vae_model).eval().to(self.device)
+        if self.fp16:
+            decoder = decoder.half()
         
         model_def = VAEDecoderTRT(fp16=self.fp16, device=self.device)
         sample_inputs = model_def.get_sample_input(batch_size, height, width, num_frames)
