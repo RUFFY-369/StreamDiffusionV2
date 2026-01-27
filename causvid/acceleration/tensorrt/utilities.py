@@ -168,28 +168,27 @@ class Engine:
             raise RuntimeError("TensorRT is not available")
         
         logger.info(f"Loading TensorRT engine: {self.engine_path}")
-        self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
+        
+        # Use native TensorRT loading instead of polygraphy for TRT 10 compatibility
+        trt_logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(trt_logger)
+        
+        with open(self.engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        
+        if self.engine is None:
+            raise RuntimeError(f"Failed to load engine from {self.engine_path}")
     
     def activate(self, reuse_device_memory: Optional[int] = None):
         """
         Create execution context for dynamic shape engine.
         
-        For TensorRT 10+, uses ON_PROFILE_CHANGE allocation strategy to defer
-        memory allocation until input shapes are set.
+        Uses manual memory management to bypass TRT 10's automatic allocation
+        which can fail with very large memory requests.
         """
-        if reuse_device_memory:
-            self.context = self.engine.create_execution_context_without_device_memory()
-            self.context.device_memory = reuse_device_memory
-        else:
-            # For TRT 10+ with dynamic shapes, use deferred memory allocation
-            # This prevents TRT from allocating for max profile shapes immediately
-            try:
-                # Try TRT 10 API with allocation strategy
-                alloc_strategy = trt.ExecutionContextAllocationStrategy.ON_PROFILE_CHANGE
-                self.context = self.engine.create_execution_context(alloc_strategy)
-            except (TypeError, AttributeError):
-                # Fallback for older TRT versions
-                self.context = self.engine.create_execution_context()
+        # For TRT 10+ with dynamic shapes, use manual memory management
+        # to completely bypass TRT's internal allocation
+        self.context = self.engine.create_execution_context_without_device_memory()
         
         if self.context is None:
             raise RuntimeError("Failed to create TensorRT execution context")
@@ -232,6 +231,42 @@ class Engine:
                     if hasattr(shape, '__iter__'):
                         shape = tuple(shape)
                     self.context.set_input_shape(name, shape)
+        
+        # Allocate device memory for the context AFTER setting input shapes
+        # For TRT 10 with dynamic shapes, device_memory_size_v2 can return garbage
+        # We need to query the actual required size after setting input shapes
+        try:
+            # TRT 10: Use update_device_memory_size_for_shapes or infer from output shapes
+            # First, try to get actual memory requirement from context
+            if hasattr(self.context, 'update_device_memory_size_for_shapes'):
+                self.context.update_device_memory_size_for_shapes()
+            
+            # Get device memory size based on actual input shapes
+            device_mem_size = self.engine.get_device_memory_size_for_profile(0)
+        except (AttributeError, TypeError):
+            # Fallback: Calculate based on I/O tensor sizes
+            device_mem_size = 0
+        
+        # For dynamic shapes, we can also estimate memory as a reasonable multiple
+        # of I/O buffer sizes. VAE encoder needs ~3GB, so use 4GB as safe default.
+        if device_mem_size <= 0 or device_mem_size > 100 * (1024**3):  # >100GB is garbage
+            device_mem_size = 4 * 1024 * 1024 * 1024  # 4 GB default workspace
+            logger.warning(f"Using default device memory size: {device_mem_size / (1024**3):.1f} GB")
+        
+        if device_mem_size > 0:
+            # Free old memory if size changed
+            if hasattr(self, '_device_memory') and self._device_memory is not None:
+                if hasattr(self, '_device_memory_size') and self._device_memory_size != device_mem_size:
+                    cudart.cudaFree(self._device_memory)
+                    self._device_memory = None
+            
+            # Allocate CUDA memory for TRT's internal use
+            if not hasattr(self, '_device_memory') or self._device_memory is None:
+                err, self._device_memory = cudart.cudaMalloc(device_mem_size)
+                if err != cudart.cudaError_t.cudaSuccess:
+                    raise RuntimeError(f"Failed to allocate {device_mem_size} bytes for TRT device memory")
+                self._device_memory_size = device_mem_size
+            self.context.device_memory = self._device_memory
         
         # Now allocate tensors for all I/O
         for idx in range(self.engine.num_io_tensors):

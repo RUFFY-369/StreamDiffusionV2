@@ -110,6 +110,18 @@ def parse_args():
         help="Skip T5 engine build (recommended for prod - T5 gives <1%% speedup)",
     )
     parser.add_argument(
+        "--skip_dit",
+        action="store_true",
+        default=False,
+        help="Skip DiT engine build (use when DiT already built and valid)",
+    )
+    parser.add_argument(
+        "--vae_only",
+        action="store_true",
+        default=False,
+        help="Build only VAE engines (encoder + decoder)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -201,16 +213,45 @@ def main():
     )
     
     if pipeline is not None:
-        # Use full pipeline for building
-        engines = builder.build_all(
-            pipeline=pipeline,
-            batch_size=args.batch_size,
-            height=args.height,
-            width=args.width,
-            num_frames=args.num_frames,
-            skip_onnx_optimize=args.skip_onnx_optimize,
-            skip_t5=args.skip_t5,
-        )
+        engines = {}
+        
+        # Handle selective building
+        if args.vae_only or args.skip_dit:
+            logger.info("Selective build mode - building individual components")
+            
+            # Build VAE if not skipped
+            if args.build_vae or args.vae_only:
+                logger.info("Building VAE encoder...")
+                builder.build_vae_encoder(
+                    pipeline.vae, args.batch_size, args.height, args.width, args.num_frames
+                )
+                engines["vae_encoder"] = builder._get_engine_path("vae_encoder")
+                
+                logger.info("Building VAE decoder...")
+                builder.build_vae_decoder(
+                    pipeline.vae, args.batch_size, args.height, args.width, args.num_frames
+                )
+                engines["vae_decoder"] = builder._get_engine_path("vae_decoder")
+            
+            # Build DiT if not skipped
+            if not args.skip_dit and not args.vae_only:
+                logger.info("Building DiT engine...")
+                builder.build_dit(
+                    pipeline, args.batch_size, args.height, args.width,
+                    args.num_frames, args.skip_onnx_optimize
+                )
+                engines["dit"] = builder._get_engine_path("dit")
+        else:
+            # Use build_all for full build
+            engines = builder.build_all(
+                pipeline=pipeline,
+                batch_size=args.batch_size,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                skip_onnx_optimize=args.skip_onnx_optimize,
+                skip_t5=args.skip_t5,
+            )
         
         logger.info("\nBuilt engines:")
         for name, path in engines.items():
