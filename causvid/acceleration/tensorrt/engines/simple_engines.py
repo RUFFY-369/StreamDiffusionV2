@@ -1,0 +1,380 @@
+# Copyright 2025-26 StreamDiffusionV2 Authors
+"""
+Simplified TensorRT engine wrapper for CausalWanModel (DiT).
+
+This wrapper matches the `forward_export` interface which was used to build
+the TensorRT engine - it takes simplified inputs without explicit KV cache
+tensors (caches are handled internally or omitted for full-context inference).
+"""
+
+import logging
+from typing import Dict, Optional, Tuple
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+# Lazy imports
+_Engine = None
+_cuda = None
+
+
+def _get_engine_class():
+    global _Engine
+    if _Engine is None:
+        from causvid.acceleration.tensorrt.utilities import Engine
+        _Engine = Engine
+    return _Engine
+
+
+def _get_cuda():
+    global _cuda
+    if _cuda is None:
+        from polygraphy import cuda
+        _cuda = cuda
+    return _cuda
+
+
+class DiTEngineSimple:
+    """
+    Simplified TensorRT engine wrapper for DiT model.
+    
+    Matches the `forward_export` interface:
+    - Input: x, timestep, context, grid_sizes
+    - Output: denoised output tensor
+    
+    No explicit KV cache management (suitable for full-context inference).
+    
+    Usage:
+        engine = DiTEngineSimple("./trt_engines/dit.engine")
+        output = engine(x, timestep, context, grid_sizes)
+    """
+    
+    def __init__(
+        self,
+        engine_path: str,
+        use_cuda_graph: bool = True,
+        device: str = "cuda",
+    ):
+        self.engine_path = engine_path
+        self.use_cuda_graph = use_cuda_graph
+        self.device = device
+        
+        # Lazy load on first use
+        self._engine = None
+        self._stream = None
+        self._loaded = False
+        self._last_shape_hash = None
+        
+        logger.info(f"DiTEngineSimple initialized: {engine_path}")
+    
+    def _ensure_loaded(self):
+        """Lazy load the engine on first use."""
+        if self._loaded:
+            return
+        
+        Engine = _get_engine_class()
+        cuda = _get_cuda()
+        
+        self._engine = Engine(self.engine_path)
+        self._engine.load()
+        self._engine.activate()
+        self._stream = cuda.Stream()
+        self._loaded = True
+        
+        logger.info(f"Loaded DiT engine: {self.engine_path}")
+    
+    def _shape_hash(self, x: torch.Tensor) -> int:
+        return hash((x.shape, x.dtype))
+    
+    def __call__(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run DiT inference.
+        
+        Args:
+            x: [B, F, C, H, W] noisy latents (float16)
+            timestep: [B, F] diffusion timesteps (long)
+            context: [B, text_len, text_dim] text embeddings (float16)
+            grid_sizes: [B, 3] containing (F, H', W') patch grid sizes
+        
+        Returns:
+            output: [B, C, F', H', W'] denoised prediction
+        """
+        self._ensure_loaded()
+        
+        # Check if we need to reallocate buffers
+        shape_hash = self._shape_hash(x)
+        if shape_hash != self._last_shape_hash:
+            shape_dict = {
+                "x": x.shape,
+                "timestep": timestep.shape,
+                "context": context.shape,
+                "grid_sizes": grid_sizes.shape,
+            }
+            self._engine.allocate_buffers(shape_dict, self.device)
+            
+            if self.use_cuda_graph:
+                self._engine.reset_cuda_graph()
+            
+            self._last_shape_hash = shape_hash
+        
+        # Run inference
+        outputs = self._engine.infer(
+            {
+                "x": x.contiguous(),
+                "timestep": timestep.contiguous(),
+                "context": context.contiguous(),
+                "grid_sizes": grid_sizes.contiguous(),
+            },
+            self._stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        
+        # Get output (name may vary)
+        output = outputs.get("output")
+        if output is None:
+            # Try to find the first output tensor
+            for name, tensor in outputs.items():
+                if tensor.dim() == 5:  # [B, C, F, H, W]
+                    output = tensor
+                    break
+        
+        return output
+    
+    def reset_cuda_graph(self):
+        """Reset CUDA graph for recapture."""
+        if self._engine is not None:
+            self._engine.reset_cuda_graph()
+        self._last_shape_hash = None
+
+
+class VAEEngineSimple:
+    """
+    Simplified TensorRT engine wrapper for VAE encoder/decoder.
+    
+    Usage:
+        vae = VAEEngineSimple(
+            encoder_path="./trt_engines/vae_encoder.engine",
+            decoder_path="./trt_engines/vae_decoder.engine",
+        )
+        latent = vae.encode(video)
+        video = vae.decode(latent)
+    """
+    
+    def __init__(
+        self,
+        encoder_path: str,
+        decoder_path: str,
+        use_cuda_graph: bool = True,
+        device: str = "cuda",
+    ):
+        self.encoder_path = encoder_path
+        self.decoder_path = decoder_path
+        self.use_cuda_graph = use_cuda_graph
+        self.device = device
+        
+        # Lazy load
+        self._encoder = None
+        self._decoder = None
+        self._stream = None
+        self._loaded = False
+        
+        self._encoder_last_shape = None
+        self._decoder_last_shape = None
+        
+        # Normalization constants
+        mean = [
+            -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+            0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
+        ]
+        std = [
+            2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
+        ]
+        self._mean = torch.tensor(mean, dtype=torch.float32).view(1, 16, 1, 1, 1)
+        self._std = torch.tensor(std, dtype=torch.float32).view(1, 16, 1, 1, 1)
+        self.z_dim = 16
+        
+        logger.info(f"VAEEngineSimple initialized")
+    
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        
+        Engine = _get_engine_class()
+        cuda = _get_cuda()
+        
+        self._encoder = Engine(self.encoder_path)
+        self._encoder.load()
+        self._encoder.activate()
+        
+        self._decoder = Engine(self.decoder_path)
+        self._decoder.load()
+        self._decoder.activate()
+        
+        self._stream = cuda.Stream()
+        
+        self._mean = self._mean.to(self.device)
+        self._std = self._std.to(self.device)
+        
+        self._loaded = True
+        logger.info("Loaded VAE encoder and decoder engines")
+    
+    def _normalize(self, mu: torch.Tensor) -> torch.Tensor:
+        """Apply latent normalization."""
+        return (mu - self._mean) / self._std
+    
+    def _denormalize(self, z: torch.Tensor) -> torch.Tensor:
+        """Remove latent normalization."""
+        return z * self._std + self._mean
+    
+    def encode(self, video: torch.Tensor) -> torch.Tensor:
+        """
+        Encode video to latent space.
+        
+        Args:
+            video: [B, C, T, H, W] video tensor, values in [-1, 1]
+        
+        Returns:
+            latent: [B, z_dim, T//4, H//8, W//8] normalized latent
+        """
+        self._ensure_loaded()
+        
+        if video.shape != self._encoder_last_shape:
+            self._encoder.allocate_buffers({"video": video.shape}, self.device)
+            if self.use_cuda_graph:
+                self._encoder.reset_cuda_graph()
+            self._encoder_last_shape = video.shape
+        
+        outputs = self._encoder.infer(
+            {"video": video.contiguous()},
+            self._stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        
+        mu = outputs["latent"]
+        return self._normalize(mu.float()).to(video.dtype)
+    
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latent to video.
+        
+        Args:
+            latent: [B, z_dim, T_lat, H_lat, W_lat] normalized latent
+        
+        Returns:
+            video: [B, C, T, H, W] video tensor, values in [-1, 1]
+        """
+        self._ensure_loaded()
+        
+        z = self._denormalize(latent.float()).to(latent.dtype)
+        
+        if z.shape != self._decoder_last_shape:
+            self._decoder.allocate_buffers({"latent": z.shape}, self.device)
+            if self.use_cuda_graph:
+                self._decoder.reset_cuda_graph()
+            self._decoder_last_shape = z.shape
+        
+        outputs = self._decoder.infer(
+            {"latent": z.contiguous()},
+            self._stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        
+        return outputs["video"].clamp(-1, 1)
+
+
+class TRTAcceleratedPipeline:
+    """
+    TensorRT-accelerated inference pipeline.
+    
+    Combines DiT and VAE TensorRT engines for end-to-end video generation.
+    T5 text encoder runs in PyTorch (runs once per prompt, minimal overhead).
+    
+    Usage:
+        pipeline = TRTAcceleratedPipeline(
+            dit_engine_path="./trt_engines/dit.engine",
+            vae_encoder_path="./trt_engines/vae_encoder.engine",
+            vae_decoder_path="./trt_engines/vae_decoder.engine",
+            text_encoder=original_text_encoder,  # PyTorch T5
+        )
+        
+        # Encode text prompt (PyTorch)
+        context = pipeline.encode_text(prompt)
+        
+        # Generate video (TensorRT)
+        video = pipeline.generate(context, num_frames=21)
+    """
+    
+    def __init__(
+        self,
+        dit_engine_path: str,
+        vae_encoder_path: str,
+        vae_decoder_path: str,
+        text_encoder=None,
+        use_cuda_graph: bool = True,
+        device: str = "cuda",
+    ):
+        self.device = device
+        self.use_cuda_graph = use_cuda_graph
+        
+        # Initialize TensorRT engines
+        self.dit = DiTEngineSimple(
+            dit_engine_path,
+            use_cuda_graph=use_cuda_graph,
+            device=device,
+        )
+        
+        self.vae = VAEEngineSimple(
+            vae_encoder_path,
+            vae_decoder_path,
+            use_cuda_graph=use_cuda_graph,
+            device=device,
+        )
+        
+        # Keep PyTorch text encoder
+        self.text_encoder = text_encoder
+        
+        logger.info("TRTAcceleratedPipeline initialized")
+    
+    def encode_text(self, prompt: str) -> torch.Tensor:
+        """
+        Encode text prompt to context embedding.
+        
+        Uses PyTorch T5 encoder (runs once per prompt).
+        """
+        if self.text_encoder is None:
+            raise ValueError("Text encoder not provided")
+        return self.text_encoder.forward(prompt)
+    
+    def encode_video(self, video: torch.Tensor) -> torch.Tensor:
+        """Encode video to latent space using TensorRT VAE."""
+        return self.vae.encode(video)
+    
+    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode latent to video using TensorRT VAE."""
+        return self.vae.decode(latent)
+    
+    def denoise_step(
+        self,
+        noisy_latent: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Single denoising step using TensorRT DiT.
+        
+        Args:
+            noisy_latent: [B, F, C, H, W]
+            timestep: [B, F]
+            context: [B, text_len, text_dim]
+            grid_sizes: [B, 3]
+        """
+        return self.dit(noisy_latent, timestep, context, grid_sizes)

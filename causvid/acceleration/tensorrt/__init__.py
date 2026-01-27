@@ -32,6 +32,12 @@ def _get_models():
         _lazy_imports['models'] = models
     return _lazy_imports['models']
 
+def _get_causal_model_trt():
+    if 'causal_model_trt' not in _lazy_imports:
+        from . import causal_model_trt
+        _lazy_imports['causal_model_trt'] = causal_model_trt
+    return _lazy_imports['causal_model_trt']
+
 # Re-export with lazy loading
 def __getattr__(name):
     """Lazy attribute loading for TensorRT dependencies."""
@@ -53,6 +59,11 @@ def __getattr__(name):
         return _get_models().VAEDecoderTRT
     elif name == "T5EncoderTRT":
         return _get_models().T5EncoderTRT
+    # Inference wrappers
+    elif name == "CausalWanModelTRTInference":
+        return _get_causal_model_trt().CausalWanModelTRTInference
+    elif name == "load_trt_model":
+        return _get_causal_model_trt().load_trt_model
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -67,5 +78,9 @@ __all__ = [
     "VAEEncoderTRT",
     "VAEDecoderTRT", 
     "T5EncoderTRT",
+    # Inference wrappers
+    "CausalWanModelTRTInference",
+    "load_trt_model",
 ]
+
 

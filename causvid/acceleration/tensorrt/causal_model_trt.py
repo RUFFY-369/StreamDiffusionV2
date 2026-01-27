@@ -501,3 +501,185 @@ class CausalWanModelTRTExport(nn.Module):
             outputs.append(u)
         
         return torch.stack(outputs)
+
+
+# =============================================================================
+# TensorRT Engine Inference Wrapper
+# =============================================================================
+
+class CausalWanModelTRTInference:
+    """
+    TensorRT-accelerated inference wrapper for CausalWanModel.
+    
+    Loads the pre-built TensorRT engine and provides a drop-in replacement
+    for the PyTorch model's forward method.
+    
+    Usage:
+        # Load engine
+        model = CausalWanModelTRTInference("./trt_engines/dit.engine")
+        
+        # Run inference (same interface as forward_export)
+        output = model(x, timestep, context, grid_sizes)
+    
+    Note:
+        This uses the `forward_export` interface (no explicit KV cache).
+        For streaming inference with KV cache, use CausalWanModelEngine from
+        engines/dit_engine.py instead.
+    """
+    
+    def __init__(
+        self,
+        engine_path: str,
+        use_cuda_graph: bool = True,
+        device: str = "cuda",
+    ):
+        """
+        Initialize TensorRT inference wrapper.
+        
+        Args:
+            engine_path: Path to built TensorRT engine (.engine file)
+            use_cuda_graph: Enable CUDA graphs for reduced kernel launch overhead
+            device: Device to run inference on
+        """
+        self.engine_path = engine_path
+        self.use_cuda_graph = use_cuda_graph
+        self.device = device
+        
+        # Lazy load engine on first use to avoid import issues
+        self._engine = None
+        self._stream = None
+        self._loaded = False
+        self._last_shape_hash = None
+    
+    def _ensure_loaded(self):
+        """Load engine on first inference call."""
+        if self._loaded:
+            return
+        
+        from .utilities import Engine
+        from polygraphy import cuda
+        
+        self._engine = Engine(self.engine_path)
+        self._engine.load()
+        self._engine.activate()
+        self._stream = cuda.Stream()
+        self._loaded = True
+    
+    def _shape_hash(self, x: torch.Tensor) -> int:
+        """Compute shape hash for buffer reuse checking."""
+        return hash((tuple(x.shape), x.dtype))
+    
+    def __call__(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run TensorRT inference.
+        
+        Same interface as CausalWanModelTRTExport.forward_export().
+        
+        Args:
+            x: [B, F, C, H, W] noisy latents
+            timestep: [B, F] diffusion timesteps
+            context: [B, text_len, text_dim] text embeddings
+            grid_sizes: [B, 3] containing (F, H', W')
+        
+        Returns:
+            output: [B, C, F', H', W'] denoised prediction
+        """
+        self._ensure_loaded()
+        
+        # Check if shapes changed and reallocate buffers if needed
+        shape_hash = self._shape_hash(x)
+        if shape_hash != self._last_shape_hash:
+            shape_dict = {
+                "x": tuple(x.shape),
+                "timestep": tuple(timestep.shape),
+                "context": tuple(context.shape),
+                "grid_sizes": tuple(grid_sizes.shape),
+            }
+            self._engine.allocate_buffers(shape_dict, self.device)
+            
+            if self.use_cuda_graph:
+                self._engine.reset_cuda_graph()
+            
+            self._last_shape_hash = shape_hash
+        
+        # Run inference
+        outputs = self._engine.infer(
+            {
+                "x": x.contiguous(),
+                "timestep": timestep.contiguous(),
+                "context": context.contiguous(),
+                "grid_sizes": grid_sizes.contiguous(),
+            },
+            self._stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        
+        # Extract output tensor
+        output = outputs.get("output")
+        if output is None:
+            # Fallback: find first 5D tensor in outputs
+            for name, tensor in outputs.items():
+                if tensor.dim() == 5:
+                    output = tensor
+                    break
+        
+        return output
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Alias for __call__ to match PyTorch module interface."""
+        return self(x, timestep, context, grid_sizes)
+    
+    def reset_cuda_graph(self):
+        """Reset CUDA graph for recapture (e.g., after shape change)."""
+        if self._engine is not None:
+            self._engine.reset_cuda_graph()
+        self._last_shape_hash = None
+    
+    @property
+    def is_loaded(self) -> bool:
+        """Check if engine is loaded."""
+        return self._loaded
+    
+    def to(self, device):
+        """Move to device (no-op, for interface compatibility)."""
+        self.device = str(device)
+        return self
+    
+    def eval(self):
+        """Set to eval mode (no-op, for interface compatibility)."""
+        return self
+    
+    def half(self):
+        """Set to half precision (no-op, TensorRT handles precision)."""
+        return self
+
+
+def load_trt_model(engine_path: str, **kwargs) -> CausalWanModelTRTInference:
+    """
+    Convenience function to load a TensorRT-accelerated model.
+    
+    Args:
+        engine_path: Path to TensorRT engine file
+        **kwargs: Additional arguments for CausalWanModelTRTInference
+    
+    Returns:
+        TensorRT inference wrapper
+    
+    Example:
+        model = load_trt_model("./trt_engines/dit.engine")
+        output = model(x, timestep, context, grid_sizes)
+    """
+    return CausalWanModelTRTInference(engine_path, **kwargs)
+

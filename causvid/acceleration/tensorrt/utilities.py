@@ -317,7 +317,7 @@ def export_onnx(
     input_names: List[str],
     output_names: List[str],
     dynamic_axes: Optional[Dict] = None,
-    opset_version: int = 17,
+    opset_version: int = 18,  # Use opset 18 for _upsample_nearest_exact2d support
     use_dynamo: bool = False,
 ):
     """

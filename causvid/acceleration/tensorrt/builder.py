@@ -248,6 +248,11 @@ class EngineBuilder:
         if self.fp16:
             encoder = encoder.half()
         
+        # Patch Upsample layers to use 'nearest' instead of 'nearest-exact' for ONNX compatibility
+        for module in encoder.modules():
+            if isinstance(module, torch.nn.Upsample) and module.mode == 'nearest-exact':
+                module.mode = 'nearest'
+        
         model_def = VAEEncoderTRT(fp16=self.fp16, device=self.device)
         sample_inputs = model_def.get_sample_input(batch_size, height, width, num_frames)
         
@@ -305,6 +310,11 @@ class EngineBuilder:
         decoder = VAEDecoderWrapper(vae_model).eval().to(self.device)
         if self.fp16:
             decoder = decoder.half()
+        
+        # Patch Upsample layers to use 'nearest' instead of 'nearest-exact' for ONNX compatibility
+        for module in decoder.modules():
+            if isinstance(module, torch.nn.Upsample) and module.mode == 'nearest-exact':
+                module.mode = 'nearest'
         
         model_def = VAEDecoderTRT(fp16=self.fp16, device=self.device)
         sample_inputs = model_def.get_sample_input(batch_size, height, width, num_frames)
