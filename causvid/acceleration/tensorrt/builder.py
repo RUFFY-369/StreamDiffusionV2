@@ -402,6 +402,7 @@ class EngineBuilder:
         num_frames: int = 21,
         skip_onnx_optimize: bool = False,
         skip_t5: bool = False,
+        skip_vae: bool = True,  # Default True - TRT VAE has 3D conv issues
     ) -> Dict[str, Path]:
         """
         Build all TensorRT engines.
@@ -414,6 +415,7 @@ class EngineBuilder:
             num_frames: Number of frames
             skip_onnx_optimize: Skip ONNX optimization step
             skip_t5: Skip T5 encoder engine (recommended - gives <1% speedup)
+            skip_vae: Skip VAE engines (default True - use PyTorch VAE instead)
         
         Returns:
             Dictionary of component name -> engine path
@@ -422,6 +424,8 @@ class EngineBuilder:
         logger.info(f"Configuration: {batch_size}x{height}x{width}, {num_frames} frames")
         if skip_t5:
             logger.info("Skipping T5 engine (--skip_t5 flag set)")
+        if skip_vae:
+            logger.info("Skipping VAE engines (use PyTorch VAE for better perf)")
         
         engines = {}
         
@@ -438,11 +442,12 @@ class EngineBuilder:
         self.build_dit(pipeline, batch_size, height, width, num_frames, skip_onnx_optimize)
         engines["dit"] = self._get_engine_path("dit")
         
-        # Build VAE
-        self.build_vae_encoder(vae, batch_size, height, width, num_frames)
-        self.build_vae_decoder(vae, batch_size, height, width, num_frames)
-        engines["vae_encoder"] = self._get_engine_path("vae_encoder")
-        engines["vae_decoder"] = self._get_engine_path("vae_decoder")
+        # Build VAE (optional - skip by default due to 3D conv perf issues)
+        if not skip_vae:
+            self.build_vae_encoder(vae, batch_size, height, width, num_frames)
+            self.build_vae_decoder(vae, batch_size, height, width, num_frames)
+            engines["vae_encoder"] = self._get_engine_path("vae_encoder")
+            engines["vae_decoder"] = self._get_engine_path("vae_decoder")
         
         # Build T5 (optional - skipped for production since it gives <1% speedup)
         if not skip_t5:

@@ -98,6 +98,12 @@ def parse_args():
         help="Build VAE engines",
     )
     parser.add_argument(
+        "--skip_vae",
+        action="store_true",
+        default=True,  # Skip VAE by default - TRT VAE is slow due to 3D conv dynamic shapes
+        help="Skip VAE engine build (default: True - use PyTorch VAE instead)",
+    )
+    parser.add_argument(
         "--build_t5",
         action="store_true",
         default=True,
@@ -120,6 +126,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Build only VAE engines (encoder + decoder)",
+    )
+    parser.add_argument(
+        "--dit_only",
+        action="store_true",
+        default=False,
+        help="Build only DiT engine (recommended for prod)",
     )
     parser.add_argument(
         "--verbose",
@@ -215,12 +227,22 @@ def main():
     if pipeline is not None:
         engines = {}
         
-        # Handle selective building
-        if args.vae_only or args.skip_dit:
+        # Handle selective building modes
+        if args.dit_only:
+            # Build only DiT (recommended for production)
+            logger.info("DiT-only mode - skipping VAE and T5")
+            logger.info("Building DiT engine...")
+            builder.build_dit(
+                pipeline, args.batch_size, args.height, args.width,
+                args.num_frames, args.skip_onnx_optimize
+            )
+            engines["dit"] = builder._get_engine_path("dit")
+            
+        elif args.vae_only or args.skip_dit:
             logger.info("Selective build mode - building individual components")
             
             # Build VAE if not skipped
-            if args.build_vae or args.vae_only:
+            if (args.build_vae or args.vae_only) and not args.skip_vae:
                 logger.info("Building VAE encoder...")
                 builder.build_vae_encoder(
                     pipeline.vae, args.batch_size, args.height, args.width, args.num_frames
@@ -232,6 +254,8 @@ def main():
                     pipeline.vae, args.batch_size, args.height, args.width, args.num_frames
                 )
                 engines["vae_decoder"] = builder._get_engine_path("vae_decoder")
+            elif args.skip_vae:
+                logger.info("Skipping VAE (--skip_vae is True, use PyTorch VAE instead)")
             
             # Build DiT if not skipped
             if not args.skip_dit and not args.vae_only:
@@ -242,7 +266,10 @@ def main():
                 )
                 engines["dit"] = builder._get_engine_path("dit")
         else:
-            # Use build_all for full build
+            # Default build - respects skip_vae flag
+            if args.skip_vae:
+                logger.info("Skipping VAE build (--skip_vae default, TRT VAE has 3D conv issues)")
+            
             engines = builder.build_all(
                 pipeline=pipeline,
                 batch_size=args.batch_size,
@@ -251,6 +278,7 @@ def main():
                 num_frames=args.num_frames,
                 skip_onnx_optimize=args.skip_onnx_optimize,
                 skip_t5=args.skip_t5,
+                skip_vae=args.skip_vae,
             )
         
         logger.info("\nBuilt engines:")

@@ -294,29 +294,36 @@ class TRTAcceleratedPipeline:
     """
     TensorRT-accelerated inference pipeline.
     
-    Combines DiT and VAE TensorRT engines for end-to-end video generation.
+    Combines DiT TensorRT engine with optional VAE acceleration.
     T5 text encoder runs in PyTorch (runs once per prompt, minimal overhead).
     
+    VAE can be:
+    - TensorRT (if vae_encoder_path/vae_decoder_path provided)
+    - PyTorch (if pytorch_vae provided, or as fallback)
+    
     Usage:
+        # Option 1: TRT DiT + PyTorch VAE (recommended)
+        pipeline = TRTAcceleratedPipeline(
+            dit_engine_path="./trt_engines/dit.engine",
+            pytorch_vae=original_vae,  # PyTorch WanVAE
+            text_encoder=original_text_encoder,
+        )
+        
+        # Option 2: Full TRT (if VAE engines work)
         pipeline = TRTAcceleratedPipeline(
             dit_engine_path="./trt_engines/dit.engine",
             vae_encoder_path="./trt_engines/vae_encoder.engine",
             vae_decoder_path="./trt_engines/vae_decoder.engine",
-            text_encoder=original_text_encoder,  # PyTorch T5
+            text_encoder=original_text_encoder,
         )
-        
-        # Encode text prompt (PyTorch)
-        context = pipeline.encode_text(prompt)
-        
-        # Generate video (TensorRT)
-        video = pipeline.generate(context, num_frames=21)
     """
     
     def __init__(
         self,
         dit_engine_path: str,
-        vae_encoder_path: str,
-        vae_decoder_path: str,
+        vae_encoder_path: Optional[str] = None,
+        vae_decoder_path: Optional[str] = None,
+        pytorch_vae=None,
         text_encoder=None,
         use_cuda_graph: bool = True,
         device: str = "cuda",
@@ -324,19 +331,38 @@ class TRTAcceleratedPipeline:
         self.device = device
         self.use_cuda_graph = use_cuda_graph
         
-        # Initialize TensorRT engines
+        # Initialize TensorRT DiT engine
         self.dit = DiTEngineSimple(
             dit_engine_path,
             use_cuda_graph=use_cuda_graph,
             device=device,
         )
         
-        self.vae = VAEEngineSimple(
-            vae_encoder_path,
-            vae_decoder_path,
-            use_cuda_graph=use_cuda_graph,
-            device=device,
-        )
+        # Initialize VAE (TRT or PyTorch)
+        self._use_trt_vae = False
+        self.vae = None
+        self._pytorch_vae = None
+        
+        if vae_encoder_path and vae_decoder_path:
+            try:
+                self.vae = VAEEngineSimple(
+                    vae_encoder_path,
+                    vae_decoder_path,
+                    use_cuda_graph=use_cuda_graph,
+                    device=device,
+                )
+                self._use_trt_vae = True
+                logger.info("Using TensorRT VAE")
+            except Exception as e:
+                logger.warning(f"Failed to load TRT VAE: {e}, falling back to PyTorch")
+                self._use_trt_vae = False
+        
+        if not self._use_trt_vae:
+            if pytorch_vae is not None:
+                self._pytorch_vae = pytorch_vae
+                logger.info("Using PyTorch VAE (recommended - faster than current TRT VAE)")
+            else:
+                logger.warning("No VAE provided! encode_video/decode_latent will fail.")
         
         # Keep PyTorch text encoder
         self.text_encoder = text_encoder
@@ -354,12 +380,26 @@ class TRTAcceleratedPipeline:
         return self.text_encoder.forward(prompt)
     
     def encode_video(self, video: torch.Tensor) -> torch.Tensor:
-        """Encode video to latent space using TensorRT VAE."""
-        return self.vae.encode(video)
+        """Encode video to latent space."""
+        if self._use_trt_vae:
+            return self.vae.encode(video)
+        elif self._pytorch_vae is not None:
+            # Use PyTorch VAE
+            with torch.no_grad():
+                return self._pytorch_vae.encode(video)
+        else:
+            raise ValueError("No VAE available for encoding")
     
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        """Decode latent to video using TensorRT VAE."""
-        return self.vae.decode(latent)
+        """Decode latent to video."""
+        if self._use_trt_vae:
+            return self.vae.decode(latent)
+        elif self._pytorch_vae is not None:
+            # Use PyTorch VAE
+            with torch.no_grad():
+                return self._pytorch_vae.decode(latent)
+        else:
+            raise ValueError("No VAE available for decoding")
     
     def denoise_step(
         self,
@@ -378,3 +418,4 @@ class TRTAcceleratedPipeline:
             grid_sizes: [B, 3]
         """
         return self.dit(noisy_latent, timestep, context, grid_sizes)
+
