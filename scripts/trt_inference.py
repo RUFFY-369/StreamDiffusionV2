@@ -324,6 +324,7 @@ def main():
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--num_frames", type=int, default=81)
+    parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
