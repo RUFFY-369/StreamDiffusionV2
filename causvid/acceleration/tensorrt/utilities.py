@@ -171,13 +171,25 @@ class Engine:
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
     
     def activate(self, reuse_device_memory: Optional[int] = None):
-        """Create execution context for dynamic shape engine."""
+        """
+        Create execution context for dynamic shape engine.
+        
+        For TensorRT 10+, uses ON_PROFILE_CHANGE allocation strategy to defer
+        memory allocation until input shapes are set.
+        """
         if reuse_device_memory:
             self.context = self.engine.create_execution_context_without_device_memory()
             self.context.device_memory = reuse_device_memory
         else:
-            # For dynamic shape engines, use deferred memory allocation
-            self.context = self.engine.create_execution_context()
+            # For TRT 10+ with dynamic shapes, use deferred memory allocation
+            # This prevents TRT from allocating for max profile shapes immediately
+            try:
+                # Try TRT 10 API with allocation strategy
+                alloc_strategy = trt.ExecutionContextAllocationStrategy.ON_PROFILE_CHANGE
+                self.context = self.engine.create_execution_context(alloc_strategy)
+            except (TypeError, AttributeError):
+                # Fallback for older TRT versions
+                self.context = self.engine.create_execution_context()
         
         if self.context is None:
             raise RuntimeError("Failed to create TensorRT execution context")
