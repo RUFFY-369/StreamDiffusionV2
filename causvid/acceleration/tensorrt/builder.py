@@ -401,6 +401,7 @@ class EngineBuilder:
         width: int = 832,
         num_frames: int = 21,
         skip_onnx_optimize: bool = False,
+        skip_t5: bool = False,
     ) -> Dict[str, Path]:
         """
         Build all TensorRT engines.
@@ -412,12 +413,15 @@ class EngineBuilder:
             width: Video width
             num_frames: Number of frames
             skip_onnx_optimize: Skip ONNX optimization step
+            skip_t5: Skip T5 encoder engine (recommended - gives <1% speedup)
         
         Returns:
             Dictionary of component name -> engine path
         """
         logger.info(f"Building all TensorRT engines in {self.engine_dir}")
         logger.info(f"Configuration: {batch_size}x{height}x{width}, {num_frames} frames")
+        if skip_t5:
+            logger.info("Skipping T5 engine (--skip_t5 flag set)")
         
         engines = {}
         
@@ -440,10 +444,13 @@ class EngineBuilder:
         engines["vae_encoder"] = self._get_engine_path("vae_encoder")
         engines["vae_decoder"] = self._get_engine_path("vae_decoder")
         
-        # Build T5
-        self.build_t5_encoder(text_encoder, batch_size)
-        engines["t5_encoder"] = self._get_engine_path("t5_encoder")
+        # Build T5 (optional - skipped for production since it gives <1% speedup)
+        if not skip_t5:
+            self.build_t5_encoder(text_encoder, batch_size)
+            engines["t5_encoder"] = self._get_engine_path("t5_encoder")
+        else:
+            logger.info("T5 engine skipped - PyTorch T5 will be used at runtime")
         
         logger.info("All TensorRT engines built successfully!")
         return engines
-        return engines
+

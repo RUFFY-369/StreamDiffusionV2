@@ -104,6 +104,12 @@ def parse_args():
         help="Build T5 encoder engine",
     )
     parser.add_argument(
+        "--skip_t5",
+        action="store_true",
+        default=False,
+        help="Skip T5 engine build (recommended for prod - T5 gives <1%% speedup)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -203,6 +209,7 @@ def main():
             width=args.width,
             num_frames=args.num_frames,
             skip_onnx_optimize=args.skip_onnx_optimize,
+            skip_t5=args.skip_t5,
         )
         
         logger.info("\nBuilt engines:")
