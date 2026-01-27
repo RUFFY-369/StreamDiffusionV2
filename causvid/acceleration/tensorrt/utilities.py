@@ -171,19 +171,28 @@ class Engine:
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
     
     def activate(self, reuse_device_memory: Optional[int] = None):
-        """Create execution context."""
+        """Create execution context for dynamic shape engine."""
         if reuse_device_memory:
             self.context = self.engine.create_execution_context_without_device_memory()
             self.context.device_memory = reuse_device_memory
         else:
+            # For dynamic shape engines, use deferred memory allocation
             self.context = self.engine.create_execution_context()
+        
+        if self.context is None:
+            raise RuntimeError("Failed to create TensorRT execution context")
     
     def allocate_buffers(
         self, 
         shape_dict: Optional[Dict[str, Tuple]] = None, 
         device: str = "cuda"
     ):
-        """Allocate GPU buffers for engine I/O."""
+        """
+        Allocate GPU buffers for engine I/O.
+        
+        For dynamic shape engines, shape_dict MUST be provided with actual
+        input shapes to avoid TensorRT using uninitialized dimensions.
+        """
         # Check if we can reuse existing buffers
         if self._can_reuse_buffers(shape_dict, device):
             return
@@ -198,28 +207,51 @@ class Engine:
                 CUASSERT(cudart.cudaGraphDestroy(self.graph))
                 self.graph = None
         
+        # CRITICAL: For dynamic shape engines, set ALL input shapes FIRST
+        # before querying output shapes or allocating memory
+        if shape_dict:
+            for idx in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(idx)
+                mode = self.engine.get_tensor_mode(name)
+                
+                if mode == trt.TensorIOMode.INPUT and name in shape_dict:
+                    shape = shape_dict[name]
+                    # Convert to tuple if it's a torch.Size
+                    if hasattr(shape, '__iter__'):
+                        shape = tuple(shape)
+                    self.context.set_input_shape(name, shape)
+        
+        # Now allocate tensors for all I/O
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
-            
-            if shape_dict and name in shape_dict:
-                shape = shape_dict[name]
-            else:
-                shape = self.engine.get_tensor_shape(name)
-            
-            dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
             mode = self.engine.get_tensor_mode(name)
             
-            if mode == trt.TensorIOMode.INPUT:
-                self.context.set_input_shape(name, shape)
+            if shape_dict and name in shape_dict:
+                shape = tuple(shape_dict[name])
+            else:
+                # For outputs, get shape after inputs are set
+                shape = self.context.get_tensor_shape(name)
+                # Convert to list to check for dynamic dims
+                shape = tuple(shape)
+            
+            # Check for invalid shapes (negative or zero dimensions)
+            if any(d <= 0 for d in shape):
+                raise ValueError(
+                    f"Invalid shape for tensor '{name}': {shape}. "
+                    f"For dynamic shape engines, provide shape_dict with explicit shapes."
+                )
+            
+            dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
             
             tensor = torch.empty(
-                tuple(shape),
+                shape,
                 dtype=numpy_to_torch_dtype_dict[dtype_np]
             ).to(device=device)
             self.tensors[name] = tensor
         
         self._last_shape_dict = shape_dict.copy() if shape_dict else None
         self._last_device = device
+
     
     def _can_reuse_buffers(
         self, 
