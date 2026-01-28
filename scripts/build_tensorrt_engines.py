@@ -144,6 +144,11 @@ def parse_args():
         action="store_true",
         help="Skip ONNX optimization step (saves RAM, TensorRT handles optimization)",
     )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Build streaming-optimized DiT engine with KV cache",
+    )
     return parser.parse_args()
 
 
@@ -279,6 +284,7 @@ def main():
                 skip_onnx_optimize=args.skip_onnx_optimize,
                 skip_t5=args.skip_t5,
                 skip_vae=args.skip_vae,
+                streaming=args.streaming,
             )
         
         logger.info("\nBuilt engines:")

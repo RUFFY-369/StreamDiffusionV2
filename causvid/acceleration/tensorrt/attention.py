@@ -276,10 +276,31 @@ class TRTCausalSelfAttention(nn.Module):
             new_kv_cache_v = kv_cache_v.clone()
             
             for i in range(b):
-                start_idx = int(cache_seqlens[i].item()) if cache_seqlens is not None else 0
-                end_idx = start_idx + s
-                new_kv_cache_k[i, start_idx:end_idx] = k[i]
-                new_kv_cache_v[i, start_idx:end_idx] = v[i]
+                if current_start is not None:
+                    # Ring buffer update using explicit start/end indices
+                    start_idx = int(current_start[i].item()) if isinstance(current_start, torch.Tensor) else int(current_start)
+                    # For simplicty in TRT, we assume contiguous update matchng input length
+                    # The original PyTorch logic handles complex rolling, but here we assume
+                    # the cache is large enough or managed as a ring buffer externally
+                    end_idx = start_idx + s
+                    
+                    # Handle wrapping if implementing full ring buffer inside TRT?
+                    # For now, simplistic slice update
+                    if end_idx <= new_kv_cache_k.shape[1]:
+                         new_kv_cache_k[i, start_idx:end_idx] = k[i]
+                         new_kv_cache_v[i, start_idx:end_idx] = v[i]
+                    else:
+                        # naive wrap around handling if needed, or just clamp
+                        valid_len = new_kv_cache_k.shape[1] - start_idx
+                        if valid_len > 0:
+                            new_kv_cache_k[i, start_idx:start_idx+valid_len] = k[i, :valid_len]
+                            new_kv_cache_v[i, start_idx:start_idx+valid_len] = v[i, :valid_len]
+                else:
+                    # Append logic (non-streaming or simple growing cache)
+                    start_idx = int(cache_seqlens[i].item()) if cache_seqlens is not None else 0
+                    end_idx = start_idx + s
+                    new_kv_cache_k[i, start_idx:end_idx] = k[i]
+                    new_kv_cache_v[i, start_idx:end_idx] = v[i]
             
             # Use full cache for attention
             k_full = new_kv_cache_k[:, :end_idx]

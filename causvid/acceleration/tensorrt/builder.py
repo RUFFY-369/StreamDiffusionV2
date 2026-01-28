@@ -211,7 +211,127 @@ class EngineBuilder:
         gc.collect()
         torch.cuda.empty_cache()
         
-        logger.info(f"DiT engine built successfully: {engine_path}")
+        return engine
+    
+    def build_dit_streaming(
+        self,
+        pipeline,
+        batch_size: int = 1,
+        height: int = 480,
+        width: int = 832,
+        num_frames: int = 1,  # Streaming chunk size
+        max_seq_len: int = 50000,
+        skip_onnx_optimize: bool = False,
+    ) -> Optional[Engine]:
+        """Build TensorRT engine for DiT model with Streaming KV Cache support."""
+        component = "dit_streaming"
+        engine_path = self._get_engine_path(component)
+        
+        if self._engine_exists(component):
+            logger.info(f"DiT Streaming engine exists: {engine_path}")
+            return None
+            
+        logger.info("Building DiT Streaming TensorRT engine...")
+        
+        from .causal_model_trt import CausalWanModelTRTExport
+        
+        # We need the model structure
+        original_model = pipeline.generator.model
+        trt_model = CausalWanModelTRTExport.from_pretrained_model(original_model)
+        
+        # Clean up original model
+        del original_model
+        pipeline.generator.model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        trt_model.eval().to(self.device)
+        if self.fp16:
+            trt_model = trt_model.half()
+            
+        class DiTStreamingWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+            def forward(self, x, t, c, g, kv, cs, ce):
+                return self.model.forward_export_streaming(x, t, c, g, kv, cs, ce)
+
+        export_model = DiTStreamingWrapper(trt_model).eval()
+        
+        # Prepare sample inputs
+        lat_h, lat_w = height // 8, width // 8
+        dtype = torch.float16 if self.fp16 else torch.float32
+        
+        # KV Cache dims
+        num_layers = 30 # T2V-1.3B
+        if "14B" in self.model_type: num_layers = 40
+        num_heads = 12 # T2V-1.3B
+        head_dim = 128
+        
+        sample_inputs = {
+            "x": torch.randn(batch_size, num_frames, 16, lat_h, lat_w, device=self.device, dtype=dtype),
+            "timestep": torch.randint(0, 1000, (batch_size, num_frames), device=self.device),
+            "context": torch.randn(batch_size, 512, 4096, device=self.device, dtype=dtype),
+            "grid_sizes": torch.tensor([[num_frames, lat_h // 2, lat_w // 2]] * batch_size, device=self.device, dtype=torch.long),
+            "kv_cache": torch.randn(num_layers, 2, batch_size, max_seq_len // 10, num_heads, head_dim, device=self.device, dtype=dtype),
+            "current_start": torch.zeros(batch_size, device=self.device, dtype=torch.long),
+            "current_end": torch.zeros(batch_size, device=self.device, dtype=torch.long),
+        }
+        
+        input_names = ["x", "timestep", "context", "grid_sizes", "kv_cache", "current_start", "current_end"]
+        output_names = ["output", "new_kv_cache"]
+        
+        dynamic_axes = {
+            "x": {0: "batch", 1: "frames", 3: "height", 4: "width"},
+            "timestep": {0: "batch", 1: "frames"},
+            "context": {0: "batch"},
+            "grid_sizes": {0: "batch"},
+            "kv_cache": {2: "batch", 3: "seq_len"},
+            "current_start": {0: "batch"},
+            "current_end": {0: "batch"},
+            "output": {0: "batch", 2: "frames", 3: "height", 4: "width"},
+            "new_kv_cache": {2: "batch", 3: "seq_len"},
+        }
+        
+        onnx_path = str(self._get_onnx_path(component))
+        export_onnx(
+            export_model,
+            onnx_path,
+            tuple(sample_inputs.values()),
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            use_dynamo=True, 
+        )
+        
+        if skip_onnx_optimize:
+            onnx_opt_path = onnx_path
+        else:
+            onnx_opt_path = str(self._get_onnx_opt_path(component))
+            optimize_onnx(onnx_path, onnx_opt_path)
+            
+        # Profiles for streaming
+        input_profile = {
+            "x": ((1, 1, 16, lat_h//2, lat_w//2), (batch_size, num_frames, 16, lat_h, lat_w), (batch_size, num_frames, 16, lat_h, lat_w)),
+            "timestep": ((1, 1), (batch_size, num_frames), (batch_size, num_frames)),
+            "context": ((1, 512, 4096), (batch_size, 512, 4096), (batch_size, 512, 4096)),
+            "grid_sizes": ((1, 3), (batch_size, 3), (batch_size, 3)),
+            "kv_cache": (
+                (num_layers, 2, 1, 1, num_heads, head_dim),
+                (num_layers, 2, batch_size, max_seq_len, num_heads, head_dim),
+                (num_layers, 2, batch_size, max_seq_len, num_heads, head_dim)
+            ),
+            "current_start": ((1,), (batch_size,), (batch_size,)),
+            "current_end": ((1,), (batch_size,), (batch_size,)),
+        }
+        
+        engine = build_engine(
+            str(engine_path),
+            onnx_opt_path,
+            input_profile,
+            fp16=self.fp16,
+        )
+        
         return engine
     
     def build_vae_encoder(
@@ -403,6 +523,7 @@ class EngineBuilder:
         skip_onnx_optimize: bool = False,
         skip_t5: bool = False,
         skip_vae: bool = True,  # Default True - TRT VAE has 3D conv issues
+        streaming: bool = True, # Default True for streaming support
     ) -> Dict[str, Path]:
         """
         Build all TensorRT engines.
@@ -414,47 +535,54 @@ class EngineBuilder:
             width: Video width
             num_frames: Number of frames
             skip_onnx_optimize: Skip ONNX optimization step
-            skip_t5: Skip T5 encoder engine (recommended - gives <1% speedup)
-            skip_vae: Skip VAE engines (default True - use PyTorch VAE instead)
+            skip_t5: Skip T5 encoder engine
+            skip_vae: Skip VAE engines
+            streaming: Build streaming-optimized DiT engine (dit_streaming) instead of standard dit
         
         Returns:
             Dictionary of component name -> engine path
         """
         logger.info(f"Building all TensorRT engines in {self.engine_dir}")
-        logger.info(f"Configuration: {batch_size}x{height}x{width}, {num_frames} frames")
-        if skip_t5:
-            logger.info("Skipping T5 engine (--skip_t5 flag set)")
-        if skip_vae:
-            logger.info("Skipping VAE engines (use PyTorch VAE for better perf)")
+        logger.info(f"Configuration: {batch_size}x{height}x{width}, {num_frames} frames, streaming={streaming}")
         
         engines = {}
         
         # Free up memory by deleting unused pipeline components before DiT export
-        # DiT export is the most memory-intensive
         vae = pipeline.vae  # Save reference
         text_encoder = pipeline.text_encoder  # Save reference
         
-        # Clear any cached tensors
         gc.collect()
         torch.cuda.empty_cache()
         
-        # Build DiT first (most memory intensive)
-        self.build_dit(pipeline, batch_size, height, width, num_frames, skip_onnx_optimize)
-        engines["dit"] = self._get_engine_path("dit")
+        # Build DiT (most memory intensive)
+        if streaming:
+            # Streaming engine requires large KV cache but fixed small batch/frame
+            # For streaming, num_frames usually 1 (chunk size), but we keep original arg for compatibility
+            self.build_dit_streaming(
+                pipeline, 
+                batch_size, 
+                height, 
+                width, 
+                num_frames=1, # Streaming uses 1 frame chunks
+                skip_onnx_optimize=skip_onnx_optimize
+            )
+            engines["dit"] = self._get_engine_path("dit_streaming")
+        else:
+            self.build_dit(pipeline, batch_size, height, width, num_frames, skip_onnx_optimize)
+            engines["dit"] = self._get_engine_path("dit")
         
-        # Build VAE (optional - skip by default due to 3D conv perf issues)
+        # Build VAE
         if not skip_vae:
+            # Reassign VAE to pipeline just in case (though we saved ref)
             self.build_vae_encoder(vae, batch_size, height, width, num_frames)
             self.build_vae_decoder(vae, batch_size, height, width, num_frames)
             engines["vae_encoder"] = self._get_engine_path("vae_encoder")
             engines["vae_decoder"] = self._get_engine_path("vae_decoder")
         
-        # Build T5 (optional - skipped for production since it gives <1% speedup)
+        # Build T5
         if not skip_t5:
             self.build_t5_encoder(text_encoder, batch_size)
             engines["t5_encoder"] = self._get_engine_path("t5_encoder")
-        else:
-            logger.info("T5 engine skipped - PyTorch T5 will be used at runtime")
         
         logger.info("All TensorRT engines built successfully!")
         return engines

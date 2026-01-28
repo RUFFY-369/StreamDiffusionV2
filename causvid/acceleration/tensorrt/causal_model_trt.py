@@ -502,6 +502,93 @@ class CausalWanModelTRTExport(nn.Module):
         
         return torch.stack(outputs)
 
+    def forward_export_streaming(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        kv_cache: torch.Tensor,
+        current_start: torch.Tensor,
+        current_end: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for streaming inference with KV cache support.
+        
+        Args:
+            x: [B, F, C, H, W] noisy latents
+            timestep: [B, F] timesteps
+            context: [B, text_len, dim] text embeddings
+            grid_sizes: [B, 3] containing (F, H, W)
+            kv_cache: [NumLayers, 2, B, MaxSeqLen, NumHeads, HeadDim]
+                Huge tensor containing K and V caches for all layers
+            current_start: [B] start index for cache update
+            current_end: [B] end index for cache update
+            
+        Returns:
+            output: [B, C, F', H', W']
+            new_kv_cache: [NumLayers, 2, B, MaxSeqLen, NumHeads, HeadDim]
+                Updated cache tensor
+        """
+        device = x.device
+        b = x.shape[0]
+        
+        # Embed patches
+        x = self.patch_embedding(x.permute(0, 2, 1, 3, 4))
+        x = x.flatten(2).transpose(1, 2)
+        
+        seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
+        
+        # Time embeddings
+        t_emb = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()))
+        e = self.time_projection(t_emb).unflatten(1, (6, self.dim))
+        e = e.unflatten(0, timestep.shape)
+        
+        # Unpack cache tensor: [Layers, 2, B, MaxSeq, Heads, D]
+        # We process layer by layer
+        new_caches = []
+        
+        # Helper: unpack modulation
+        num_frames = e.shape[1]
+        frame_seqlen = x.shape[1] // num_frames
+        
+        for i, block in enumerate(self.blocks):
+            # Extract cache for this layer: [2, B, MaxSeq, Heads, D]
+            layer_cache = kv_cache[i] 
+            k_cache = layer_cache[0]
+            v_cache = layer_cache[1]
+            
+            # Forward block
+            x, new_k, new_v, _, _ = block(
+                x, e, seq_lens, grid_sizes, self.freqs, context, None, None,
+                kv_cache_k=k_cache, kv_cache_v=v_cache,
+                cache_seqlens=current_start, # Uses start as current length marker
+                current_start=current_start,
+                current_end=current_end
+            )
+            
+            # Stack updated K/V for this layer
+            new_layer_cache = torch.stack([new_k, new_v])
+            new_caches.append(new_layer_cache)
+            
+        # Head
+        x_normed = self.head_norm(x).unflatten(1, (num_frames, frame_seqlen))
+        
+        # Head modulation
+        # Recompute head modulation since it's hard to pass state for it?
+        # Actually head modulation depends on time embedding 'e'.
+        # Recalculate e_head logic from forward()
+        e_head = t_emb.unflatten(0, timestep.shape).unsqueeze(2)
+        e_mod = (self.head_modulation.unsqueeze(1) + e_head).chunk(2, dim=2)
+        
+        x = self.head_linear(x_normed * (1 + e_mod[1]) + e_mod[0])
+        x = self._unpatchify(x, grid_sizes)
+        
+        # Stack all layer caches: [Layers, 2, B, MaxSeq, Heads, D]
+        new_kv_cache_tensor = torch.stack(new_caches)
+        
+        return x, new_kv_cache_tensor
+
 
 # =============================================================================
 # TensorRT Engine Inference Wrapper

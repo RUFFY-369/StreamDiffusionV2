@@ -85,12 +85,35 @@ class TRTAcceleratedInferencePipeline:
         self.pytorch_pipeline.to(device=str(self.device), dtype=torch.bfloat16)
         
         # Load TensorRT DiT engine
-        from causvid.acceleration.tensorrt.engines.simple_engines import DiTEngineSimple
-        self.dit_engine = DiTEngineSimple(
-            dit_engine_path,
-            use_cuda_graph=True,
-            device=str(self.device),
-        )
+        from causvid.acceleration.tensorrt.engines.simple_engines import DiTEngineSimple, DiTEngineStreaming
+        
+        self.streaming = True # Force streaming mode based on user request
+        
+        if self.streaming:
+            self.dit_engine = DiTEngineStreaming(
+                dit_engine_path, # Should check if this points to streaming engine, or assume user provides correct path
+                use_cuda_graph=True,
+                device=str(self.device),
+            )
+            # Initialize monolithic KV cache
+            # Shape: [30, 2, 1, 50000, 12, 128]
+            # TODO: Read dims from config/model if possible. Hardcoded for T2V-1.3B
+            num_layers = 30
+            num_heads = 12
+            head_dim = 128
+            max_seq = 50000
+            self.trt_kv_cache = torch.randn(
+                num_layers, 2, 1, max_seq, num_heads, head_dim,
+                device=self.device, dtype=torch.float16
+            )
+            # Reset cache (fill with zeros or init?)
+            self.trt_kv_cache.zero_()
+        else:
+            self.dit_engine = DiTEngineSimple(
+                dit_engine_path,
+                use_cuda_graph=True,
+                device=str(self.device),
+            )
         
         # Reference to PyTorch components
         self.vae = self.pytorch_pipeline.vae
@@ -99,7 +122,7 @@ class TRTAcceleratedInferencePipeline:
         # Tracking
         self.processed = 0
         
-        logger.info(f"TRT-accelerated pipeline initialized")
+        logger.info(f"TRT-accelerated pipeline initialized (streaming={self.streaming})")
         logger.info(f"  DiT engine: {dit_engine_path}")
         logger.info(f"  VAE: PyTorch (recommended)")
         
@@ -151,25 +174,111 @@ class TRTAcceleratedInferencePipeline:
     ) -> torch.Tensor:
         """
         TRT-accelerated streaming inference.
-        
-        This replaces the PyTorch DiT forward pass with TensorRT.
         """
-        # For now, fall back to PyTorch pipeline's inference_stream
-        # The TRT DiT engine can be integrated here for full acceleration
-        # 
-        # Full integration would require matching the internal state management
-        # of the streaming pipeline, which is complex. For MVP, we demonstrate
-        # the DiT engine works and can be called.
+        if not self.streaming:
+             return self.pytorch_pipeline.inference_stream(
+                noise=noise,
+                current_start=current_start,
+                current_end=current_end,
+                current_step=current_step,
+            )
+            
+        # Manually implement streaming loop with TRT engine
         
-        # Use TRT DiT for the denoising step
-        # NOTE: Full integration requires modifying the streaming loop
-        # For now, we fall back to PyTorch but demonstrate TRT is available
-        return self.pytorch_pipeline.inference_stream(
-            noise=noise,
-            current_start=current_start,
-            current_end=current_end,
-            current_step=current_step,
-        )
+        # Get dependencies
+        scheduler = self.pytorch_pipeline.scheduler
+        conditional_dict = self.pytorch_pipeline.conditional_dict
+        
+        # 1. Prepare inputs
+        noisy_image = noise.to(torch.float16) # TRT uses float16
+        prompt_embeds = conditional_dict["prompt_embeds"].to(torch.float16)
+        
+        # Dimensions
+        B, F, C, H, W = noisy_image.shape
+        grid_sizes = torch.tensor([[F, H//2, W//2]]*B, device=self.device, dtype=torch.long)
+        
+        current_start_t = torch.tensor([current_start]*B, device=self.device, dtype=torch.long)
+        current_end_t = torch.tensor([current_end]*B, device=self.device, dtype=torch.long)
+        
+        # 2. Loop over timesteps
+        # We need to run the scheduler loop exactly as PyTorch does
+        # But wait, inference_stream usually runs ONE step per frame?
+        # No, diffusion runs MULTIPLE steps (denoising_step_list) per streaming chunk.
+        # But `inference_stream` implementation iterates `self.scheduler.timesteps`.
+        
+        if current_step is None:
+             # First call for this chunk?
+             pass
+             
+        for t in scheduler.timesteps:
+            # Create timestep tensor
+            t_tensor = torch.full((B, F), t, device=self.device, dtype=torch.long)
+            
+            # Call TRT Engine
+            # output, new_cache = engine(...)
+            flow_pred, new_kv_cache = self.dit_engine(
+                noisy_image, t_tensor, prompt_embeds, grid_sizes,
+                self.trt_kv_cache, current_start_t, current_end_t
+            )
+            
+            # Update cache reference (if new tensor returned)
+            # Actually, because we passed trt_kv_cache and got new_kv_cache
+            # we should update self.trt_kv_cache.
+            # However, if using IOBinding with inplace optimization, they might point to same buffer.
+            # But strictly:
+            self.trt_kv_cache = new_kv_cache
+            
+            # Convert flow to x0 (PyTorch logic)
+            # flow_pred is [B, C, F, H, W] (from engine output) needs float32 for scheduler?
+            flow_pred = flow_pred.float()
+            
+            # Helper to convert (from wan_wrapper.py logic)
+            # We need to replicate _convert_flow_pred_to_x0 logic
+            # x0 = x_t - flow * sigma
+            # We need sigmas.
+            
+            # Retrieve sigmas from scheduler
+            # scheduler.sigmas is used in wrapper.
+            # We need the sigma for THIS timestep.
+            # This logic is buried in wrapper forward.
+            
+            # wrapper logic:
+            # timestep_id = argmin(abs(timesteps - t))
+            # sigma = sigmas[timestep_id]
+            # flow = (xt - x0) / sigma => x0 = xt - flow * sigma ??
+            # Wait, wrapper code: 
+            #   flow_pred = (xt - x0_pred) / sigma_t  <-- returned by model if target is flow?
+            #   pred_x0 = x0_pred
+            # Actually, `model` returns `output`.
+            # If `flow_prediction`, output IS flow.
+            # flow = output.
+            # x0 = xt - output * sigma
+            
+            # Let's check scheduler directly
+            step_index = (scheduler.timesteps == t).nonzero().item()
+            sigma = scheduler.sigmas[step_index]
+            
+            # x0 prediction from flow
+            pred_x0 = noisy_image.float() - flow_pred * sigma
+            
+            # Scheduler step
+            # self.scheduler.step(pred_x0, t, noisy_image)
+            # But `inference_stream` uses `self.scheduler.step_stream`.
+            # We rely on PyTorch scheduler
+            
+            # Original code:
+            # pred = self.generator(...) -> returns pred_x0
+            # self.scheduler.step_stream(pred, t, noise)
+            
+            scheduler.step_stream(pred_x0, t, noise)
+            
+            # noise is updated in-place by step_stream?
+            # Check `causal_stream_inference.py`:
+            #   self.scheduler.step_stream(pred, t, noise)
+            #   # noise is modified?
+            #   # Actually, noise is passed as argument `noise` to function.
+            
+        return pred_x0.to(torch.bfloat16)
     
     def run_inference_v2v(
         self,

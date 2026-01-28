@@ -154,6 +154,98 @@ class DiTEngineSimple:
         self._last_shape_hash = None
 
 
+class DiTEngineStreaming:
+    """
+    Streaming TensorRT engine wrapper for DiT model.
+    
+    Supports explicit KV cache inputs/outputs for stateful inference.
+    """
+    def __init__(
+        self,
+        engine_path: str,
+        use_cuda_graph: bool = True,
+        device: str = "cuda",
+    ):
+        self.engine_path = engine_path
+        self.use_cuda_graph = use_cuda_graph
+        self.device = device
+        
+        self._engine = None
+        self._stream = None
+        self._loaded = False
+        self._last_shape_hash = None
+        
+        logger.info(f"DiTEngineStreaming initialized: {engine_path}")
+    
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+            
+        Engine = _get_engine_class()
+        cuda = _get_cuda()
+        
+        self._engine = Engine(self.engine_path)
+        self._engine.load()
+        self._engine.activate()
+        self._stream = cuda.Stream()
+        self._loaded = True
+        logger.info(f"Loaded DiT Streaming engine: {self.engine_path}")
+    
+    def _shape_hash(self, x: torch.Tensor, kv_cache: torch.Tensor) -> int:
+        return hash((x.shape, x.dtype, kv_cache.shape))
+    
+    def __call__(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        kv_cache: torch.Tensor,
+        current_start: torch.Tensor,
+        current_end: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run Streaming DiT inference.
+        
+        Returns:
+            output: Denoised latents
+            new_kv_cache: Updated KV cache tensor
+        """
+        self._ensure_loaded()
+        
+        shape_hash = self._shape_hash(x, kv_cache)
+        if shape_hash != self._last_shape_hash:
+            shape_dict = {
+                "x": x.shape,
+                "timestep": timestep.shape,
+                "context": context.shape,
+                "grid_sizes": grid_sizes.shape,
+                "kv_cache": kv_cache.shape,
+                "current_start": current_start.shape,
+                "current_end": current_end.shape,
+            }
+            self._engine.allocate_buffers(shape_dict, self.device)
+            if self.use_cuda_graph:
+                self._engine.reset_cuda_graph()
+            self._last_shape_hash = shape_hash
+        
+        outputs = self._engine.infer(
+            {
+                "x": x.contiguous(),
+                "timestep": timestep.contiguous(),
+                "context": context.contiguous(),
+                "grid_sizes": grid_sizes.contiguous(),
+                "kv_cache": kv_cache.contiguous(),
+                "current_start": current_start.contiguous(),
+                "current_end": current_end.contiguous(),
+            },
+            self._stream,
+            use_cuda_graph=self.use_cuda_graph,
+        )
+        
+        return outputs["output"], outputs["new_kv_cache"]
+
+
 class VAEEngineSimple:
     """
     Simplified TensorRT engine wrapper for VAE encoder/decoder.
@@ -327,16 +419,25 @@ class TRTAcceleratedPipeline:
         text_encoder=None,
         use_cuda_graph: bool = True,
         device: str = "cuda",
+        streaming: bool = False,
     ):
         self.device = device
         self.use_cuda_graph = use_cuda_graph
+        self.streaming = streaming
         
         # Initialize TensorRT DiT engine
-        self.dit = DiTEngineSimple(
-            dit_engine_path,
-            use_cuda_graph=use_cuda_graph,
-            device=device,
-        )
+        if streaming:
+             self.dit = DiTEngineStreaming(
+                dit_engine_path,
+                use_cuda_graph=use_cuda_graph,
+                device=device,
+            )
+        else:
+            self.dit = DiTEngineSimple(
+                dit_engine_path,
+                use_cuda_graph=use_cuda_graph,
+                device=device,
+            )
         
         # Initialize VAE (TRT or PyTorch)
         self._use_trt_vae = False
