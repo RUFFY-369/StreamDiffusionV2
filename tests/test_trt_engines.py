@@ -223,6 +223,112 @@ def test_dit_engine(engine_dir: str, device: str = "cuda"):
         return False
 
 
+
+def test_dit_streaming_engine(engine_dir: str, device: str = "cuda"):
+    """Test Streaming DiT engine with KV cache."""
+    from polygraphy import cuda
+    from causvid.acceleration.tensorrt.utilities import Engine
+    
+    engine_path = os.path.join(engine_dir, "dit_streaming.engine")
+    if not os.path.exists(engine_path):
+        logger.warning(f"DiT Streaming engine not found: {engine_path}")
+        return False
+    
+    logger.info(f"Testing DiT Streaming engine: {engine_path}")
+    
+    # Load engine
+    engine = Engine(engine_path)
+    engine.load()
+    engine.activate()
+    
+    stream = cuda.Stream()
+    
+    # Test inputs
+    batch_size = 1
+    num_frames = 1 # Streaming chunk size
+    height, width = 480, 832
+    lat_h, lat_w = height // 8, width // 8
+    text_len = 512
+    text_dim = 4096
+    
+    # KV Cache params
+    num_layers = 30 # T2V-1.3B
+    num_heads = 12
+    head_dim = 128
+    max_seq_len = 50000
+    
+    # x: [B, F, C, H, W]
+    x = torch.randn(batch_size, num_frames, 16, lat_h, lat_w,
+                   dtype=torch.float16, device=device)
+    timesteps = torch.randint(0, 1000, (batch_size, num_frames), device=device)
+    context = torch.randn(batch_size, text_len, text_dim,
+                         dtype=torch.float16, device=device)
+    grid_sizes = torch.tensor([[num_frames, lat_h // 2, lat_w // 2]] * batch_size,
+                             device=device, dtype=torch.long)
+    
+    # Monolithic KV Cache [layers, 2, B, seq, head, dim]
+    kv_cache = torch.randn(num_layers, 2, batch_size, max_seq_len, num_heads, head_dim,
+                          dtype=torch.float16, device=device)
+    
+    current_start = torch.zeros(batch_size, device=device, dtype=torch.long)
+    current_end = torch.zeros(batch_size, device=device, dtype=torch.long)
+    
+    # Set slice range for update
+    current_end.fill_(lat_h * lat_w) # e.g. first frame
+    
+    shape_dict = {
+        "x": x.shape,
+        "timestep": timesteps.shape,
+        "context": context.shape,
+        "grid_sizes": grid_sizes.shape,
+        "kv_cache": kv_cache.shape,
+        "current_start": current_start.shape,
+        "current_end": current_end.shape,
+    }
+    
+    try:
+        engine.allocate_buffers(shape_dict, device)
+        
+        logger.info(f"Running Streaming DiT with kv_cache shape: {kv_cache.shape}")
+        
+        start = time.perf_counter()
+        outputs = engine.infer({
+            "x": x,
+            "timestep": timesteps,
+            "context": context,
+            "grid_sizes": grid_sizes,
+            "kv_cache": kv_cache,
+            "current_start": current_start,
+            "current_end": current_end,
+        }, stream, use_cuda_graph=False) # graph might need capture reset logic
+        stream.synchronize()
+        elapsed = time.perf_counter() - start
+        
+        output = outputs.get("output")
+        new_kv = outputs.get("new_kv_cache")
+        
+        # Inplace check: if IOBinding works, new_kv might default to None or same buffer?
+        # Standard Engine implementation returns new buffers usually.
+        
+        if output is None:
+             logger.error("Output 'output' not found in engine results")
+             return False
+             
+        logger.info(f"Output shape: {output.shape}")
+        if new_kv is not None:
+            logger.info(f"New KV cache shape: {new_kv.shape}")
+            
+        logger.info(f"Inference time: {elapsed*1000:.2f} ms")
+        logger.info("✅ DiT Streaming engine test PASSED")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ DiT Streaming engine test FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test TensorRT engines")
     parser.add_argument("--engine_dir", type=str, default="./trt_engines",
@@ -230,8 +336,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use")
     parser.add_argument("--test", type=str, default="all",
-                       choices=["all", "vae_encoder", "vae_decoder", "dit"],
-                       help="Which engine to test")
+                       choices=["all", "vae_encoder", "vae_decoder", "dit", "dit_streaming"],
+                       help="Which engine to test (select one)")
     args = parser.parse_args()
     
     if not torch.cuda.is_available():
@@ -263,6 +369,9 @@ def main():
     
     if args.test in ("all", "dit"):
         results["dit"] = test_dit_engine(args.engine_dir, args.device)
+        
+    if args.test in ("all", "dit_streaming"):
+        results["dit_streaming"] = test_dit_streaming_engine(args.engine_dir, args.device)
     
     # Summary
     logger.info("\n" + "=" * 60)

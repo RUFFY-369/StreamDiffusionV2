@@ -233,15 +233,26 @@ def main():
         engines = {}
         
         # Handle selective building modes
+        # Handle selective building modes
         if args.dit_only:
             # Build only DiT (recommended for production)
             logger.info("DiT-only mode - skipping VAE and T5")
-            logger.info("Building DiT engine...")
-            builder.build_dit(
-                pipeline, args.batch_size, args.height, args.width,
-                args.num_frames, args.skip_onnx_optimize
-            )
-            engines["dit"] = builder._get_engine_path("dit")
+            logger.info(f"Building DiT engine (streaming={args.streaming})...")
+            
+            if args.streaming:
+                builder.build_dit_streaming(
+                    pipeline, args.batch_size, args.height, args.width,
+                    num_frames=1, # Streaming uses 1 frame chunks
+                    max_seq_len=50000, # Full capacity (OOM fixed in builder)
+                    skip_onnx_optimize=args.skip_onnx_optimize
+                )
+                engines["dit"] = builder._get_engine_path("dit_streaming")
+            else:
+                builder.build_dit(
+                    pipeline, args.batch_size, args.height, args.width,
+                    args.num_frames, args.skip_onnx_optimize
+                )
+                engines["dit"] = builder._get_engine_path("dit")
             
         elif args.vae_only or args.skip_dit:
             logger.info("Selective build mode - building individual components")

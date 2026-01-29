@@ -268,12 +268,16 @@ class EngineBuilder:
         num_heads = 12 # T2V-1.3B
         head_dim = 128
         
+        # Use small seq len for export to save memory (ONNX export only needs valid graph)
+        # But larger max_seq_len for optimization profile to support long streaming
+        export_seq_len = 128 
+        
         sample_inputs = {
             "x": torch.randn(batch_size, num_frames, 16, lat_h, lat_w, device=self.device, dtype=dtype),
             "timestep": torch.randint(0, 1000, (batch_size, num_frames), device=self.device),
             "context": torch.randn(batch_size, 512, 4096, device=self.device, dtype=dtype),
             "grid_sizes": torch.tensor([[num_frames, lat_h // 2, lat_w // 2]] * batch_size, device=self.device, dtype=torch.long),
-            "kv_cache": torch.randn(num_layers, 2, batch_size, max_seq_len // 10, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache": torch.randn(num_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
             "current_start": torch.zeros(batch_size, device=self.device, dtype=torch.long),
             "current_end": torch.zeros(batch_size, device=self.device, dtype=torch.long),
         }
@@ -315,14 +319,14 @@ class EngineBuilder:
             "x": ((1, 1, 16, lat_h//2, lat_w//2), (batch_size, num_frames, 16, lat_h, lat_w), (batch_size, num_frames, 16, lat_h, lat_w)),
             "timestep": ((1, 1), (batch_size, num_frames), (batch_size, num_frames)),
             "context": ((1, 512, 4096), (batch_size, 512, 4096), (batch_size, 512, 4096)),
-            "grid_sizes": ((1, 3), (batch_size, 3), (batch_size, 3)),
+            # "grid_sizes": removed because it's constant folded
             "kv_cache": (
                 (num_layers, 2, 1, 1, num_heads, head_dim),
                 (num_layers, 2, batch_size, max_seq_len, num_heads, head_dim),
                 (num_layers, 2, batch_size, max_seq_len, num_heads, head_dim)
             ),
             "current_start": ((1,), (batch_size,), (batch_size,)),
-            "current_end": ((1,), (batch_size,), (batch_size,)),
+            # "current_end": removed because it's unused/pruned
         }
         
         engine = build_engine(

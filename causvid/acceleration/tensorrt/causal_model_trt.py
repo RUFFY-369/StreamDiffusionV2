@@ -26,6 +26,24 @@ from causvid.models.wan.wan_base.modules.model import (
 from .attention import TRTCausalSelfAttention, TRTCrossAttention, trt_rope_apply
 
 
+def trt_sinusoidal_embedding_1d(dim, position, dtype=torch.float32):
+    """
+    TRT-compatible sinusoidal embedding that respects dtype.
+    Original uses float64 which breaks FP16/Half export.
+    """
+    # preprocess
+    assert dim % 2 == 0
+    half = dim // 2
+    # Use float32 for high precision calculation then cast
+    position = position.float()
+
+    # calculation
+    sinusoid = torch.outer(
+        position, torch.pow(10000, -torch.arange(half, device=position.device).float().div(half)))
+    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    return x.to(dtype)
+
+
 def trt_rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> torch.Tensor:
     """
     Generate RoPE frequency parameters (real-number version for ONNX).
@@ -537,10 +555,13 @@ class CausalWanModelTRTExport(nn.Module):
         x = self.patch_embedding(x.permute(0, 2, 1, 3, 4))
         x = x.flatten(2).transpose(1, 2)
         
+        # Embed context (text) - valid for both export and inference
+        context = self.text_embedding(context)
+        
         seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
         
-        # Time embeddings
-        t_emb = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()))
+        # Time embeddings - use TRT compatible version that respects dtype
+        t_emb = self.time_embedding(trt_sinusoidal_embedding_1d(self.freq_dim, timestep.flatten(), dtype=x.dtype))
         e = self.time_projection(t_emb).unflatten(1, (6, self.dim))
         e = e.unflatten(0, timestep.shape)
         

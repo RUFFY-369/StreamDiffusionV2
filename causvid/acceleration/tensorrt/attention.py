@@ -275,28 +275,47 @@ class TRTCausalSelfAttention(nn.Module):
             new_kv_cache_k = kv_cache_k.clone()
             new_kv_cache_v = kv_cache_v.clone()
             
-            for i in range(b):
-                if current_start is not None:
-                    # Ring buffer update using explicit start/end indices
-                    start_idx = int(current_start[i].item()) if isinstance(current_start, torch.Tensor) else int(current_start)
-                    # For simplicty in TRT, we assume contiguous update matchng input length
-                    # The original PyTorch logic handles complex rolling, but here we assume
-                    # the cache is large enough or managed as a ring buffer externally
-                    end_idx = start_idx + s
+            # Vectorized or tensor-friendly update
+            # We assume batch size is small (usually 1 for streaming)
+            if current_start is not None:
+                # Use tensor operations to update cache to preserve graph connections
+                indices = torch.arange(s, device=x.device).expand(b, s)
+                start_indices = current_start.view(b, 1)
+                target_indices = indices + start_indices
+                
+                # Careful scatter update
+                # Since we update a slice [start:start+s], we can generate indices
+                # New K/V are [B, S, H, D]
+                # Cache is [B, MaxLen, H, D]
+                
+                # Handling batch loop purely with tensors is tricky for scatter if B > 1 and starts differ
+                # But we can iterate B since it is a loop in graph (or unrolled if small)
+                for i in range(b):
+                    # Get start as tensor (0-d or 1-d)
+                    start_t = current_start[i] 
+                    idx = torch.arange(s, device=x.device) + start_t
                     
-                    # Handle wrapping if implementing full ring buffer inside TRT?
-                    # For now, simplistic slice update
-                    if end_idx <= new_kv_cache_k.shape[1]:
-                         new_kv_cache_k[i, start_idx:end_idx] = k[i]
-                         new_kv_cache_v[i, start_idx:end_idx] = v[i]
-                    else:
-                        # naive wrap around handling if needed, or just clamp
-                        valid_len = new_kv_cache_k.shape[1] - start_idx
-                        if valid_len > 0:
-                            new_kv_cache_k[i, start_idx:start_idx+valid_len] = k[i, :valid_len]
-                            new_kv_cache_v[i, start_idx:start_idx+valid_len] = v[i, :valid_len]
-                else:
-                    # Append logic (non-streaming or simple growing cache)
+                    # Ensure indices are within bounds (clamp or mask)
+                    # For streaming, we assume caller manages logic, but let's be safe for tracing
+                    max_len = new_kv_cache_k.shape[1]
+                    mask = idx < max_len
+                    valid_idx = idx[mask]
+                    
+                    if valid_idx.numel() > 0:
+                        # Index update: cache[i, valid_idx] = k[i, :num_valid]
+                        # We must slice the source 'k' as well if we clamped
+                        valid_src = k[i, :valid_idx.numel()]
+                        
+                        # Use index_put_ or simple indexing which traces to Scatter/IndexPut
+                        new_kv_cache_k[i, valid_idx] = valid_src
+                        new_kv_cache_v[i, valid_idx] = v[i, :valid_idx.numel()]
+                
+                # Define end_idx for slicing the full cache for attention
+                # We use max() to handle batching, though usually B=1
+                end_idx = (current_start + s).max()
+            else:
+                # Append logic (non-streaming legacy path)
+                for i in range(b):
                     start_idx = int(cache_seqlens[i].item()) if cache_seqlens is not None else 0
                     end_idx = start_idx + s
                     new_kv_cache_k[i, start_idx:end_idx] = k[i]
