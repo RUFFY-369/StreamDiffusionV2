@@ -293,16 +293,21 @@ class TRTAcceleratedInferencePipeline:
         current_start: int,
         current_end: int,
     ):
-        """Prepare pipeline (uses TRT for initial setup)."""
-        logger.info("Preparing TRT pipeline...")
+        """Prepare pipeline (uses PyTorch for multi-timestep denoising)."""
+        logger.info("Preparing pipeline with PyTorch (initial setup)...")
         
-        # 1. Compute Text Embeddings (PyTorch pipeline's text encoder is still on GPU)
-        self.pytorch_pipeline.conditional_dict = self.pytorch_pipeline.text_encoder(
-            text_prompts=text_prompts
-        )
+        # Move PyTorch models back to GPU (they were offloaded to CPU to save VRAM)
+        if hasattr(self.pytorch_pipeline, "generator"):
+            self.pytorch_pipeline.generator.to(self.device)
+        if hasattr(self.pytorch_pipeline, "text_encoder"):
+            self.pytorch_pipeline.text_encoder.to(self.device)
         
-        # 2. Run Inference using TRT Engine
-        return self.inference_stream_trt(
+        # Delegate to PyTorch for prepare phase (complex multi-timestep denoising)
+        # TRT is better suited for the simpler inference_stream phase
+        return self.pytorch_pipeline.prepare(
+            text_prompts=text_prompts,
+            device=self.device,
+            dtype=torch.bfloat16,
             noise=noise,
             current_start=current_start,
             current_end=current_end,
@@ -316,147 +321,116 @@ class TRTAcceleratedInferencePipeline:
         current_step: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        TRT-accelerated streaming inference.
+        TRT-accelerated streaming inference (matches PyTorch's inference_stream).
+        Processes one frame through the denoising batch using TRT engine.
         """
         if not self.streaming:
-             return self.pytorch_pipeline.inference_stream(
+            return self.pytorch_pipeline.inference_stream(
                 noise=noise,
                 current_start=current_start,
                 current_end=current_end,
                 current_step=current_step,
             )
-            
-        # Manually implement streaming loop with TRT engine
         
         # Get dependencies
-        scheduler = self.pytorch_pipeline.scheduler
         conditional_dict = self.pytorch_pipeline.conditional_dict
+        device = self.device
         
-        # 1. Prepare inputs
-        noisy_image = noise.to(torch.float16) # TRT uses float16
-        prompt_embeds = conditional_dict["prompt_embeds"].to(device=self.device, dtype=torch.float16)
+        # Prepare inputs (matching PyTorch's inference_stream lines 241-256)
+        B, F, C, H, W = noise.shape
+        noisy_image = noise.to(torch.float16)  # TRT uses float16
+        prompt_embeds = conditional_dict["prompt_embeds"].to(device=device, dtype=torch.float16)
         
-        # Dimensions
-        B, F, C, H, W = noisy_image.shape
+        # Handle CFG disable case (guidance_scale=1.0 should use single batch)
+        # Cache metadata was initialized for batch size 1
+        if prompt_embeds.shape[0] > 1 and len(self.trt_kv_cache) == 1:
+            # Text encoder returned 2 embeds (neg, pos) but cache is sized for 1
+            # Use only positive prompt (index 1)
+            prompt_embeds = prompt_embeds[1:2]
         
-        # Ensure current_start_t is on DEVICE (GPU) and int64
-        current_start_t = torch.tensor([current_start]*B, device=self.device, dtype=torch.long)
+        # Calculate frame_seqlen for eviction
+        frame_seqlen = H // 2 * W // 2  # Patched dimensions
+        num_new_tokens = frame_seqlen * F  # Tokens for all frames in this batch
         
-        # 2. Loop over timesteps
-        for t in scheduler.timesteps:
-            # Create timestep tensor
-            t_tensor = torch.full((1, F), t, device=self.device, dtype=torch.long)
-            
-            # Determine batch size from prompts (usually B=2 for CFG)
-            B_text = prompt_embeds.shape[0]
-            
-            # Handle CFG disable/enable mismatch
-            if not self.enable_cfg and B_text > 1:
-                # User disabled CFG to save memory, but text encoder returned 2 embeds
-                # We slice to keep only the conditional prompt (index 1 usually, check impl)
-                # Actually usually [neg, pos]. We want pos.
-                # Assuming index 1 is positive prompt for standard SD pipes.
-                prompt_embeds = prompt_embeds[1:2]
-                B_text = 1
-            
-            # Calculate frame_seqlen for eviction (tokens per frame)
-            frame_seqlen = H // 2 * W // 2  # Patched dimensions: 480->240, 832->416 -> 30*52=1560
-            num_new_tokens = frame_seqlen  # Processing 1 frame at a time in streaming
-            
-            # Prepare inputs for batch splitting if B_text > 1
-            if B_text > 1:
-                flow_preds = []
-                # Process each batch item sequentially to fit in B=1 engine
-                for b_idx in range(B_text):
-                    # Check if eviction is needed BEFORE engine call
-                    current_end_for_batch = current_start + num_new_tokens
-                    local_end = self.cache_metadata['local_end_index'][b_idx].item()
-                    global_end = self.cache_metadata['global_end_index'][b_idx].item()
-                    kv_cache_size = self.cache_metadata['kv_cache_size']
-                    
-                    # Eviction logic (matching PyTorch lines 175-176)
-                    if (current_end_for_batch > global_end) and \
-                       (num_new_tokens + local_end > kv_cache_size):
-                        logger.info(f"[Batch {b_idx}] Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
-                        new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
-                        local_end = new_local_end
-                    
-                    # Slice inputs
-                    img_idx = b_idx if B > 1 else 0
-                    img_slice = noisy_image[img_idx:img_idx+1, -1:, ...] # [1, 1, C, H, W]
-                    
-                    t_slice = t_tensor # [1, F]
-                    prompt_slice = prompt_embeds[b_idx:b_idx+1] # [1, L, D]
-                    
-                    # Correct slicing for current_start (Batch dim is 0)
-                    start_slice = current_start_t[0:1] # [1]
-                    
-                    # Get list of cache chunks for this batch index
-                    # self.trt_kv_cache is List[List[Tensor]] -> [Batch][Chunk]
-                    cache_chunks = self.trt_kv_cache[b_idx]
-                    
-                    # Call Engine with list of chunks
-                    flow_out, _ = self.dit_engine(
-                        img_slice, t_slice, prompt_slice, 
-                        cache_chunks, start_slice
-                    )
-                    flow_preds.append(flow_out)
-                    
-                    # Update metadata AFTER engine call
-                    if current_end_for_batch > global_end:
-                        new_local = min(local_end + num_new_tokens, kv_cache_size)
-                        self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
-                        self.cache_metadata['local_end_index'][b_idx] = new_local
-                    
-                flow_pred = torch.cat(flow_preds, dim=0)
-            else:
-                # Single batch run
-                b_idx = 0
-                
-                # Check if eviction is needed BEFORE engine call
+        # Prepare current_start tensor
+        current_start_t = torch.tensor([current_start], device=device, dtype=torch.long)
+        
+        # Determine batch size from prompts (CFG support)
+        B_text = prompt_embeds.shape[0]
+        
+        # Check eviction and call TRT engine
+        if B_text > 1:
+            # CFG mode: process each batch separately
+            flow_preds = []
+            for b_idx in range(B_text):
+                # Check eviction for this batch
                 current_end_for_batch = current_start + num_new_tokens
                 local_end = self.cache_metadata['local_end_index'][b_idx].item()
                 global_end = self.cache_metadata['global_end_index'][b_idx].item()
                 kv_cache_size = self.cache_metadata['kv_cache_size']
                 
-                # Eviction logic (matching PyTorch lines 175-176)
                 if (current_end_for_batch > global_end) and \
                    (num_new_tokens + local_end > kv_cache_size):
-                    logger.info(f"[Batch {b_idx}] Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
+                    logger.info(f"[Eviction] Batch {b_idx}: Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
                     new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
                     local_end = new_local_end
                 
-                t_tensor_b = torch.full((B, 1), t, device=self.device, dtype=torch.long)
+                # Slice inputs for this batch
+                img_slice = noisy_image[:, -F:, ...]  # Use all F frames
+                prompt_slice = prompt_embeds[b_idx:b_idx+1]
+                cache_chunks = self.trt_kv_cache[b_idx]
                 
-                # Get chunks for batch 0
-                cache_chunks = self.trt_kv_cache[0]
-                img_slice = noisy_image[:, -1:, ...]
-                
-                flow_pred, _ = self.dit_engine(
-                    img_slice, t_tensor_b, prompt_embeds,
-                    cache_chunks, current_start_t
+                # Call TRT engine
+                flow_out, _ = self.dit_engine(
+                    img_slice, 
+                    torch.full((1, F), current_step if current_step is not None else 0, device=device, dtype=torch.long),
+                    prompt_slice,
+                    cache_chunks,
+                    current_start_t
                 )
+                flow_preds.append(flow_out)
                 
-                # Update metadata AFTER engine call
+                # Update metadata
                 if current_end_for_batch > global_end:
                     new_local = min(local_end + num_new_tokens, kv_cache_size)
                     self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
                     self.cache_metadata['local_end_index'][b_idx] = new_local
             
-            # Convert flow to x0 (PyTorch logic)
-            flow_pred = flow_pred.float()
+            output = torch.cat(flow_preds, dim=0)
+        else:
+            # Single batch
+            b_idx = 0
             
-            # Retrieve sigmas from scheduler
-            step_index = (scheduler.timesteps == t).nonzero().item()
-            sigma = scheduler.sigmas[step_index]
+            # Check eviction
+            current_end_for_batch = current_start + num_new_tokens
+            local_end = self.cache_metadata['local_end_index'][b_idx].item()
+            global_end = self.cache_metadata['global_end_index'][b_idx].item()
+            kv_cache_size = self.cache_metadata['kv_cache_size']
             
-            # x0 prediction from flow
-            pred_x0 = noisy_image.float() - flow_pred * sigma
+            if (current_end_for_batch > global_end) and \
+               (num_new_tokens + local_end > kv_cache_size):
+                logger.info(f"[Eviction] Batch {b_idx}: Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
+                new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
+                local_end = new_local_end
             
-            # Scheduler step
-            scheduler.step_stream(pred_x0, t, noise)
+            # Call TRT engine
+            cache_chunks = self.trt_kv_cache[0]
+            output, _ = self.dit_engine(
+                noisy_image,
+                torch.full((B, F), current_step if current_step is not None else 0, device=device, dtype=torch.long),
+                prompt_embeds,
+                cache_chunks,
+                current_start_t
+            )
             
-        return pred_x0.to(torch.bfloat16)
+            # Update metadata
+            if current_end_for_batch > global_end:
+                new_local = min(local_end + num_new_tokens, kv_cache_size)
+                self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
+                self.cache_metadata['local_end_index'][b_idx] = new_local
+        
+        # Return output (no scheduler step, PyTorch's inference_stream returns prediction directly)
+        return output.to(torch.bfloat16)
     
     def run_inference_v2v(
         self,
