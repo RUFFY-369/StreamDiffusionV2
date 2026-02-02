@@ -175,6 +175,16 @@ class TRTAcceleratedInferencePipeline:
                     for _ in range(num_chunks)
                 ]
                 self.trt_kv_cache.append(chunks)
+            
+            # Cache Metadata for Eviction Logic (matching PyTorch pipeline)
+            self.cache_metadata = {
+                'global_end_index': torch.zeros(num_caches, dtype=torch.long, device=self.device),
+                'local_end_index': torch.zeros(num_caches, dtype=torch.long, device=self.device),
+                'sink_size': 3,  # Preserve first 3 frames
+                'adapt_sink_thr': -1,  # Adaptive sink threshold (-1 = disabled)
+                'kv_cache_size': max_seq_len,  # Max cache capacity
+            }
+            logger.info(f"Cache metadata initialized: sink_size={self.cache_metadata['sink_size']}, max_capacity={max_seq_len}")
         else:
             self.dit_engine = DiTEngineSimple(
                 dit_engine_path,
@@ -232,6 +242,49 @@ class TRTAcceleratedInferencePipeline:
         # Load weights
         msg = self.pytorch_pipeline.generator.load_state_dict(state_dict, strict=False)
         logger.info(f"Checkpoint loaded. Missing keys: {len(msg.missing_keys)}, Unexpected keys: {len(msg.unexpected_keys)}")
+    
+    def _evict_kv_cache(self, batch_idx: int, num_new_tokens: int, frame_seqlen: int):
+        """
+        Evict oldest tokens from KV cache when full (excluding sink tokens).
+        Ported from causvid/models/wan/causal_model.py lines 175-189.
+        
+        Args:
+            batch_idx: Index in batch (0 for single sequence, 0/1 for CFG)
+            num_new_tokens: Number of tokens being added
+            frame_seqlen: Tokens per frame (e.g., 1560 for 480p)
+        """
+        sink_tokens = self.cache_metadata['sink_size'] * frame_seqlen
+        kv_cache_size = self.cache_metadata['kv_cache_size']
+        local_end = self.cache_metadata['local_end_index'][batch_idx].item()
+        
+        # Calculate eviction
+        num_evicted_tokens = num_new_tokens + local_end - kv_cache_size
+        num_rolled_tokens = local_end - num_evicted_tokens - sink_tokens
+        
+        logger.info(f"[Eviction] Batch {batch_idx}: Evicting {num_evicted_tokens} tokens, rolling {num_rolled_tokens} tokens")
+        
+        # Shift cache left for all chunks (evict oldest non-sink tokens)
+        cache_chunks = self.trt_kv_cache[batch_idx]
+        for chunk in cache_chunks:
+            # chunk shape: [1, 2, 1, MaxSeq, H, D]
+            # Extract K and V: [2, 1, MaxSeq, H, D]
+            kv = chunk[0]  # [2, 1, MaxSeq, H, D]
+            
+            # Shift K cache (index 0)
+            kv[0, :, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                kv[0, :, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+            
+            # Shift V cache (index 1)
+            kv[1, :, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                kv[1, :, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+        
+        # Update local end index (cache fill level after eviction)
+        new_local_end = sink_tokens + num_rolled_tokens
+        self.cache_metadata['local_end_index'][batch_idx] = new_local_end
+        
+        logger.info(f"[Eviction] Batch {batch_idx}: Cache now at {new_local_end}/{kv_cache_size} tokens")
+        
+        return new_local_end
     
     def prepare_pipeline(
         self,
@@ -306,11 +359,28 @@ class TRTAcceleratedInferencePipeline:
                 prompt_embeds = prompt_embeds[1:2]
                 B_text = 1
             
+            # Calculate frame_seqlen for eviction (tokens per frame)
+            frame_seqlen = H // 2 * W // 2  # Patched dimensions: 480->240, 832->416 -> 30*52=1560
+            num_new_tokens = frame_seqlen  # Processing 1 frame at a time in streaming
+            
             # Prepare inputs for batch splitting if B_text > 1
             if B_text > 1:
                 flow_preds = []
                 # Process each batch item sequentially to fit in B=1 engine
                 for b_idx in range(B_text):
+                    # Check if eviction is needed BEFORE engine call
+                    current_end_for_batch = current_start + num_new_tokens
+                    local_end = self.cache_metadata['local_end_index'][b_idx].item()
+                    global_end = self.cache_metadata['global_end_index'][b_idx].item()
+                    kv_cache_size = self.cache_metadata['kv_cache_size']
+                    
+                    # Eviction logic (matching PyTorch lines 175-176)
+                    if (current_end_for_batch > global_end) and \
+                       (num_new_tokens + local_end > kv_cache_size):
+                        logger.info(f"[Batch {b_idx}] Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
+                        new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
+                        local_end = new_local_end
+                    
                     # Slice inputs
                     img_idx = b_idx if B > 1 else 0
                     img_slice = noisy_image[img_idx:img_idx+1, -1:, ...] # [1, 1, C, H, W]
@@ -332,9 +402,30 @@ class TRTAcceleratedInferencePipeline:
                     )
                     flow_preds.append(flow_out)
                     
+                    # Update metadata AFTER engine call
+                    if current_end_for_batch > global_end:
+                        new_local = min(local_end + num_new_tokens, kv_cache_size)
+                        self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
+                        self.cache_metadata['local_end_index'][b_idx] = new_local
+                    
                 flow_pred = torch.cat(flow_preds, dim=0)
             else:
                 # Single batch run
+                b_idx = 0
+                
+                # Check if eviction is needed BEFORE engine call
+                current_end_for_batch = current_start + num_new_tokens
+                local_end = self.cache_metadata['local_end_index'][b_idx].item()
+                global_end = self.cache_metadata['global_end_index'][b_idx].item()
+                kv_cache_size = self.cache_metadata['kv_cache_size']
+                
+                # Eviction logic (matching PyTorch lines 175-176)
+                if (current_end_for_batch > global_end) and \
+                   (num_new_tokens + local_end > kv_cache_size):
+                    logger.info(f"[Batch {b_idx}] Cache full ({local_end + num_new_tokens}/{kv_cache_size}), triggering eviction")
+                    new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
+                    local_end = new_local_end
+                
                 t_tensor_b = torch.full((B, 1), t, device=self.device, dtype=torch.long)
                 
                 # Get chunks for batch 0
@@ -345,6 +436,12 @@ class TRTAcceleratedInferencePipeline:
                     img_slice, t_tensor_b, prompt_embeds,
                     cache_chunks, current_start_t
                 )
+                
+                # Update metadata AFTER engine call
+                if current_end_for_batch > global_end:
+                    new_local = min(local_end + num_new_tokens, kv_cache_size)
+                    self.cache_metadata['global_end_index'][b_idx] = current_end_for_batch
+                    self.cache_metadata['local_end_index'][b_idx] = new_local
             
             # Convert flow to x0 (PyTorch logic)
             flow_pred = flow_pred.float()
