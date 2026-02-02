@@ -220,7 +220,7 @@ class EngineBuilder:
         height: int = 480,
         width: int = 832,
         num_frames: int = 1,  # Streaming chunk size
-        max_seq_len: int = 50000,
+        max_seq_len: int = 150000,
         skip_onnx_optimize: bool = False,
     ) -> Optional[Engine]:
         """Build TensorRT engine for DiT model with Streaming KV Cache support."""
@@ -253,48 +253,147 @@ class EngineBuilder:
             def __init__(self, model):
                 super().__init__()
                 self.model = model
-            def forward(self, x, t, c, g, kv, cs, ce):
-                return self.model.forward_export_streaming(x, t, c, g, kv, cs, ce)
+            def forward(self, x, t, c, kv0, kv1, kv2, kv3, kv4, kv5, kv6, kv7, kv8, kv9, kv10, kv11, kv12, kv13, kv14, kv15, kv16, kv17, kv18, kv19, kv20, kv21, kv22, kv23, kv24, kv25, kv26, kv27, kv28, kv29, cs):
+                return self.model.forward_export_streaming(x, t, c, kv0, kv1, kv2, kv3, kv4, kv5, kv6, kv7, kv8, kv9, kv10, kv11, kv12, kv13, kv14, kv15, kv16, kv17, kv18, kv19, kv20, kv21, kv22, kv23, kv24, kv25, kv26, kv27, kv28, kv29, cs)
 
         export_model = DiTStreamingWrapper(trt_model).eval()
         
-        # Prepare sample inputs
+        # Prepare sample inputs (Split buffer into 5 chunks of 6 layers)
         lat_h, lat_w = height // 8, width // 8
         dtype = torch.float16 if self.fp16 else torch.float32
         
         # KV Cache dims
-        num_layers = 30 # T2V-1.3B
-        if "14B" in self.model_type: num_layers = 40
-        num_heads = 12 # T2V-1.3B
+        total_layers = 30 # T2V-1.3B
+        chunk_layers = 1 # 1 layer per chunk (Safest for TRT < 1GB)
+        num_heads = 12 
         head_dim = 128
         
-        # Use small seq len for export to save memory (ONNX export only needs valid graph)
-        # But larger max_seq_len for optimization profile to support long streaming
         export_seq_len = 128 
         
         sample_inputs = {
             "x": torch.randn(batch_size, num_frames, 16, lat_h, lat_w, device=self.device, dtype=dtype),
             "timestep": torch.randint(0, 1000, (batch_size, num_frames), device=self.device),
             "context": torch.randn(batch_size, 512, 4096, device=self.device, dtype=dtype),
-            "grid_sizes": torch.tensor([[num_frames, lat_h // 2, lat_w // 2]] * batch_size, device=self.device, dtype=torch.long),
-            "kv_cache": torch.randn(num_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            # 30 Chunks of cache
+            "kv_cache_0": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_1": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_2": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_3": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_4": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_5": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_6": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_7": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_8": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_9": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_10": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_11": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_12": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_13": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_14": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_15": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_16": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_17": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_18": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_19": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_20": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_21": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_22": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_23": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_24": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_25": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_26": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_27": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_28": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
+            "kv_cache_29": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
             "current_start": torch.zeros(batch_size, device=self.device, dtype=torch.long),
-            "current_end": torch.zeros(batch_size, device=self.device, dtype=torch.long),
         }
         
-        input_names = ["x", "timestep", "context", "grid_sizes", "kv_cache", "current_start", "current_end"]
-        output_names = ["output", "new_kv_cache"]
+        input_names = [
+            "x", "timestep", "context", 
+            "kv_cache_0", "kv_cache_1", "kv_cache_2", "kv_cache_3", "kv_cache_4",
+            "kv_cache_5", "kv_cache_6", "kv_cache_7", "kv_cache_8", "kv_cache_9",
+            "kv_cache_10", "kv_cache_11", "kv_cache_12", "kv_cache_13", "kv_cache_14",
+            "kv_cache_15", "kv_cache_16", "kv_cache_17", "kv_cache_18", "kv_cache_19",
+            "kv_cache_20", "kv_cache_21", "kv_cache_22", "kv_cache_23", "kv_cache_24",
+            "kv_cache_25", "kv_cache_26", "kv_cache_27", "kv_cache_28", "kv_cache_29",
+            "current_start"
+        ]
+        output_names = [
+            "output", 
+            "new_kv_cache_0", "new_kv_cache_1", "new_kv_cache_2", "new_kv_cache_3", "new_kv_cache_4",
+            "new_kv_cache_5", "new_kv_cache_6", "new_kv_cache_7", "new_kv_cache_8", "new_kv_cache_9",
+            "new_kv_cache_10", "new_kv_cache_11", "new_kv_cache_12", "new_kv_cache_13", "new_kv_cache_14",
+            "new_kv_cache_15", "new_kv_cache_16", "new_kv_cache_17", "new_kv_cache_18", "new_kv_cache_19",
+            "new_kv_cache_20", "new_kv_cache_21", "new_kv_cache_22", "new_kv_cache_23", "new_kv_cache_24",
+            "new_kv_cache_25", "new_kv_cache_26", "new_kv_cache_27", "new_kv_cache_28", "new_kv_cache_29"
+        ]
         
         dynamic_axes = {
             "x": {0: "batch", 1: "frames", 3: "height", 4: "width"},
             "timestep": {0: "batch", 1: "frames"},
             "context": {0: "batch"},
-            "grid_sizes": {0: "batch"},
-            "kv_cache": {2: "batch", 3: "seq_len"},
+            "kv_cache_0": {2: "batch", 3: "seq_len"},
+            "kv_cache_1": {2: "batch", 3: "seq_len"},
+            "kv_cache_2": {2: "batch", 3: "seq_len"},
+            "kv_cache_3": {2: "batch", 3: "seq_len"},
+            "kv_cache_4": {2: "batch", 3: "seq_len"},
+            "kv_cache_5": {2: "batch", 3: "seq_len"},
+            "kv_cache_6": {2: "batch", 3: "seq_len"},
+            "kv_cache_7": {2: "batch", 3: "seq_len"},
+            "kv_cache_8": {2: "batch", 3: "seq_len"},
+            "kv_cache_9": {2: "batch", 3: "seq_len"},
+            "kv_cache_10": {2: "batch", 3: "seq_len"},
+            "kv_cache_11": {2: "batch", 3: "seq_len"},
+            "kv_cache_12": {2: "batch", 3: "seq_len"},
+            "kv_cache_13": {2: "batch", 3: "seq_len"},
+            "kv_cache_14": {2: "batch", 3: "seq_len"},
+            "kv_cache_15": {2: "batch", 3: "seq_len"},
+            "kv_cache_16": {2: "batch", 3: "seq_len"},
+            "kv_cache_17": {2: "batch", 3: "seq_len"},
+            "kv_cache_18": {2: "batch", 3: "seq_len"},
+            "kv_cache_19": {2: "batch", 3: "seq_len"},
+            "kv_cache_20": {2: "batch", 3: "seq_len"},
+            "kv_cache_21": {2: "batch", 3: "seq_len"},
+            "kv_cache_22": {2: "batch", 3: "seq_len"},
+            "kv_cache_23": {2: "batch", 3: "seq_len"},
+            "kv_cache_24": {2: "batch", 3: "seq_len"},
+            "kv_cache_25": {2: "batch", 3: "seq_len"},
+            "kv_cache_26": {2: "batch", 3: "seq_len"},
+            "kv_cache_27": {2: "batch", 3: "seq_len"},
+            "kv_cache_28": {2: "batch", 3: "seq_len"},
+            "kv_cache_29": {2: "batch", 3: "seq_len"},
             "current_start": {0: "batch"},
-            "current_end": {0: "batch"},
             "output": {0: "batch", 2: "frames", 3: "height", 4: "width"},
-            "new_kv_cache": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_0": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_1": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_2": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_3": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_4": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_5": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_6": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_7": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_8": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_9": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_10": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_11": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_12": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_13": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_14": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_15": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_16": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_17": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_18": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_19": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_20": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_21": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_22": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_23": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_24": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_25": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_26": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_27": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_28": {2: "batch", 3: "seq_len"},
+            "new_kv_cache_29": {2: "batch", 3: "seq_len"},
         }
         
         onnx_path = str(self._get_onnx_path(component))
@@ -316,17 +415,41 @@ class EngineBuilder:
             
         # Profiles for streaming
         input_profile = {
-            "x": ((1, 1, 16, lat_h//2, lat_w//2), (batch_size, num_frames, 16, lat_h, lat_w), (batch_size, num_frames, 16, lat_h, lat_w)),
+            "x": ((1, 1, 16, lat_h, lat_w), (batch_size, num_frames, 16, lat_h, lat_w), (batch_size, num_frames, 16, lat_h, lat_w)),
             "timestep": ((1, 1), (batch_size, num_frames), (batch_size, num_frames)),
             "context": ((1, 512, 4096), (batch_size, 512, 4096), (batch_size, 512, 4096)),
-            # "grid_sizes": removed because it's constant folded
-            "kv_cache": (
-                (num_layers, 2, 1, 1, num_heads, head_dim),
-                (num_layers, 2, batch_size, max_seq_len, num_heads, head_dim),
-                (num_layers, 2, batch_size, max_seq_len, num_heads, head_dim)
-            ),
+            # Split profiling (1 layer per chunk)
+            "kv_cache_0": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_1": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_2": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_3": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_4": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_5": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_6": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_7": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_8": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_9": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_10": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_11": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_12": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_13": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_14": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_15": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_16": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_17": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_18": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_19": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_20": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_21": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_22": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_23": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_24": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_25": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_26": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_27": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_28": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
+            "kv_cache_29": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
             "current_start": ((1,), (batch_size,), (batch_size,)),
-            # "current_end": removed because it's unused/pruned
         }
         
         engine = build_engine(
@@ -528,6 +651,7 @@ class EngineBuilder:
         skip_t5: bool = False,
         skip_vae: bool = True,  # Default True - TRT VAE has 3D conv issues
         streaming: bool = True, # Default True for streaming support
+        max_seq_len: int = 150000, # Default max seq len
     ) -> Dict[str, Path]:
         """
         Build all TensorRT engines.
@@ -568,6 +692,7 @@ class EngineBuilder:
                 height, 
                 width, 
                 num_frames=1, # Streaming uses 1 frame chunks
+                max_seq_len=max_seq_len,
                 skip_onnx_optimize=skip_onnx_optimize
             )
             engines["dit"] = self._get_engine_path("dit_streaming")

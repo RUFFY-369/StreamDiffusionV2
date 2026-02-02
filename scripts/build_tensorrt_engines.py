@@ -147,7 +147,14 @@ def parse_args():
     parser.add_argument(
         "--streaming",
         action="store_true",
+        default=True,
         help="Build streaming-optimized DiT engine with KV cache",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=150000,
+        help="Max sequence length for KV cache (default: 150000)",
     )
     return parser.parse_args()
 
@@ -243,7 +250,7 @@ def main():
                 builder.build_dit_streaming(
                     pipeline, args.batch_size, args.height, args.width,
                     num_frames=1, # Streaming uses 1 frame chunks
-                    max_seq_len=50000, # Full capacity (OOM fixed in builder)
+                    max_seq_len=args.max_seq_len, # Use arg
                     skip_onnx_optimize=args.skip_onnx_optimize
                 )
                 engines["dit"] = builder._get_engine_path("dit_streaming")
@@ -296,6 +303,7 @@ def main():
                 skip_t5=args.skip_t5,
                 skip_vae=args.skip_vae,
                 streaming=args.streaming,
+                max_seq_len=args.max_seq_len,
             )
         
         logger.info("\nBuilt engines:")

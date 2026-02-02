@@ -10,8 +10,9 @@ Usage:
         --checkpoint_folder ./checkpoints/your_model \
         --output_folder ./outputs \
         --prompt_file_path ./prompts.txt \
-        --dit_engine_path ./trt_engines/dit.engine \
-        --video_path ./input.mp4
+        --dit_engine_path ./trt_engines/dit_streaming.engine \
+        --video_path ./input.mp4 \
+        --guidance_scale 1.0
 """
 
 import argparse
@@ -43,7 +44,8 @@ def load_mp4_as_tensor(
     
     assert os.path.exists(video_path), f"Video file not found: {video_path}"
     
-    video, _, _ = torchvision.io.read_video(video_path, output_format="TCHW")
+    # Use 'sec' units to avoid warnings and inaccurate timestamps
+    video, _, _ = torchvision.io.read_video(video_path, output_format="TCHW", pts_unit="sec")
     if max_frames is not None:
         video = video[:max_frames]
     
@@ -75,9 +77,12 @@ class TRTAcceleratedInferencePipeline:
         config,
         dit_engine_path: str,
         device: torch.device = None,
+        max_seq_len: int = 150000,
+        enable_cfg: bool = True,
     ):
         self.config = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.enable_cfg = enable_cfg
         
         # Load PyTorch pipeline for VAE and text encoder
         from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
@@ -90,24 +95,86 @@ class TRTAcceleratedInferencePipeline:
         self.streaming = True # Force streaming mode based on user request
         
         if self.streaming:
+            # FREE PYTORCH KV CACHE to save memory (~18GB for B=2)
+            # We only use TRT cache
+            if hasattr(self.pytorch_pipeline, "kv_cache1"):
+                self.pytorch_pipeline.kv_cache1 = None
+                self.pytorch_pipeline.kv_cache2 = None
+                torch.cuda.empty_cache()
+            
+            # Offload PyTorch DiT model to CPU to save VRAM (we use TRT engine)
+            if hasattr(self.pytorch_pipeline, "generator"):
+                logger.info("Offloading PyTorch DiT model to CPU to save VRAM")
+                self.pytorch_pipeline.generator.model.to("cpu")
+                
+            # Also offload Text Encoder (T5-XXL is ~22GB!)
+            if hasattr(self.pytorch_pipeline, "text_encoder"):
+                logger.info("Offloading Text Encoder to CPU to save VRAM")
+                self.pytorch_pipeline.text_encoder.to("cpu")
+                
+            torch.cuda.empty_cache()
+
             self.dit_engine = DiTEngineStreaming(
-                dit_engine_path, # Should check if this points to streaming engine, or assume user provides correct path
-                use_cuda_graph=True,
+                dit_engine_path, 
+                use_cuda_graph=False, # Must be False for dynamic control flow/shapes if unpredictable
                 device=str(self.device),
             )
-            # Initialize monolithic KV cache
-            # Shape: [30, 2, 1, 50000, 12, 128]
-            # TODO: Read dims from config/model if possible. Hardcoded for T2V-1.3B
-            num_layers = 30
+            
+            # Smart Memory Allocation - SPLIT CACHE
+            num_layers_per_chunk = 1 # 1 Layer per chunk (Safest for TRT < 1GB)
+            num_chunks = 30 # 30 Layers / 1 = 30 chunks
+            
             num_heads = 12
+            total_layers = 30
             head_dim = 128
-            max_seq = 50000
-            self.trt_kv_cache = torch.randn(
-                num_layers, 2, 1, max_seq, num_heads, head_dim,
-                device=self.device, dtype=torch.float16
-            )
-            # Reset cache (fill with zeros or init?)
-            self.trt_kv_cache.zero_()
+            dtype_size = 2 # float16
+            
+            # Calculate memory per token per batch
+            bytes_per_token = 2 * total_layers * num_heads * head_dim * dtype_size
+            
+            # Use max_seq_len from args
+            self.max_seq_len = max_seq_len
+            
+            # Check available VRAM
+            t = torch.cuda.get_device_properties(0).total_memory
+            r = torch.cuda.memory_reserved(0)
+            a = torch.cuda.memory_allocated(0)
+            free_vram = t - a 
+            
+            # Log chunk size
+            chunk_bytes = num_layers_per_chunk * 2 * max_seq_len * num_heads * head_dim * 2
+            logger.info(f"Allocating 1 x {num_chunks} TRT KV Chunks: ({num_layers_per_chunk}, 2, 1, {max_seq_len}, {num_heads}, {head_dim})")
+            logger.info(f"Size per chunk: {chunk_bytes/1e9:.2f} GB (Safe < 2.14GB)")
+            
+            logger.info(f"VRAM Stats: Total={t/1e9:.2f}GB, Allocated={a/1e9:.2f}GB, Free (approx)={(t-a)/1e9:.2f}GB")
+            
+            num_caches = 2 if self.enable_cfg else 1
+            required_mem = max_seq_len * bytes_per_token * num_caches
+            
+            if required_mem > (free_vram * 0.95):
+                logger.warning(f"WARNING: Requested cache size ({required_mem/1e9:.2f} GB) exceeds available VRAM ({free_vram/1e9:.2f} GB)!")
+                safe_mem = free_vram * 0.90
+                max_safe_seq = int(safe_mem / (bytes_per_token * num_caches))
+                logger.warning(f"Downgrading max_seq_len from {max_seq_len} to {max_safe_seq} to fit VRAM.")
+                max_seq_len = max_safe_seq
+            
+            self.max_seq_len = max_seq_len
+            
+            # Allocate 5 chunks of cache
+            # Shape per chunk: [6, 2, 1, Seq, Head, Dim]
+            chunk_shape = (num_layers_per_chunk, 2, 1, max_seq_len, num_heads, head_dim)
+            logger.info(f"Allocating {num_caches} x {num_chunks} TRT KV Chunks: {chunk_shape} (Float16)")
+            logger.info(f"Total Cache Memory: {required_mem/1e9:.2f} GB")
+            
+            # List of lists [BatchSet_0_Chunks, BatchSet_1_Chunks (if CFG)]
+            self.trt_kv_cache = []
+            for _ in range(num_caches):
+                # Valid list of 5 chunks
+                chunks = [
+                    torch.zeros(chunk_shape, device=self.device, dtype=torch.float16)
+                    for _ in range(num_chunks)
+                ]
+                self.trt_kv_cache.append(chunks)
         else:
             self.dit_engine = DiTEngineSimple(
                 dit_engine_path,
@@ -127,10 +194,28 @@ class TRTAcceleratedInferencePipeline:
         logger.info(f"  VAE: PyTorch (recommended)")
         
     def load_model(self, checkpoint_folder: str):
-        """Load model checkpoint."""
-        ckpt_path = os.path.join(checkpoint_folder, "model.pt")
-        logger.info(f"Loading checkpoint from {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        """Load model checkpoint (supports .pt and .safetensors)."""
+        import os
+        from safetensors.torch import load_file
+        
+        # Priority 1: model.pt
+        pt_path = os.path.join(checkpoint_folder, "model.pt")
+        # Priority 2: diffusion_pytorch_model.safetensors (Standard Diffusers)
+        sf_path = os.path.join(checkpoint_folder, "diffusion_pytorch_model.safetensors")
+        # Priority 3: model.safetensors
+        sf_v2_path = os.path.join(checkpoint_folder, "model.safetensors")
+        
+        if os.path.exists(pt_path):
+            logger.info(f"Loading checkpoint from {pt_path}")
+            ckpt = torch.load(pt_path, map_location="cpu")
+        elif os.path.exists(sf_path):
+            logger.info(f"Loading checkpoint from {sf_path}")
+            ckpt = load_file(sf_path)
+        elif os.path.exists(sf_v2_path):
+            logger.info(f"Loading checkpoint from {sf_v2_path}")
+            ckpt = load_file(sf_v2_path)
+        else:
+            raise FileNotFoundError(f"No checkpoint found in {checkpoint_folder}. Checked: model.pt, diffusion_pytorch_model.safetensors")
         
         if isinstance(ckpt, dict):
             if 'generator' in ckpt:
@@ -144,8 +229,9 @@ class TRTAcceleratedInferencePipeline:
         else:
             state_dict = ckpt
         
-        self.pytorch_pipeline.generator.load_state_dict(state_dict, strict=False)
-        logger.info("Checkpoint loaded")
+        # Load weights
+        msg = self.pytorch_pipeline.generator.load_state_dict(state_dict, strict=False)
+        logger.info(f"Checkpoint loaded. Missing keys: {len(msg.missing_keys)}, Unexpected keys: {len(msg.unexpected_keys)}")
     
     def prepare_pipeline(
         self,
@@ -154,12 +240,16 @@ class TRTAcceleratedInferencePipeline:
         current_start: int,
         current_end: int,
     ):
-        """Prepare pipeline (uses PyTorch for initial setup)."""
-        return self.pytorch_pipeline.prepare(
-            text_prompts=text_prompts,
-            device=self.device,
-            dtype=torch.bfloat16,
-            block_mode='input',
+        """Prepare pipeline (uses TRT for initial setup)."""
+        logger.info("Preparing TRT pipeline...")
+        
+        # 1. Compute Text Embeddings (PyTorch pipeline's text encoder is still on GPU)
+        self.pytorch_pipeline.conditional_dict = self.pytorch_pipeline.text_encoder(
+            text_prompts=text_prompts
+        )
+        
+        # 2. Run Inference using TRT Engine
+        return self.inference_stream_trt(
             noise=noise,
             current_start=current_start,
             current_end=current_end,
@@ -191,70 +281,75 @@ class TRTAcceleratedInferencePipeline:
         
         # 1. Prepare inputs
         noisy_image = noise.to(torch.float16) # TRT uses float16
-        prompt_embeds = conditional_dict["prompt_embeds"].to(torch.float16)
+        prompt_embeds = conditional_dict["prompt_embeds"].to(device=self.device, dtype=torch.float16)
         
         # Dimensions
         B, F, C, H, W = noisy_image.shape
-        grid_sizes = torch.tensor([[F, H//2, W//2]]*B, device=self.device, dtype=torch.long)
         
+        # Ensure current_start_t is on DEVICE (GPU) and int64
         current_start_t = torch.tensor([current_start]*B, device=self.device, dtype=torch.long)
-        current_end_t = torch.tensor([current_end]*B, device=self.device, dtype=torch.long)
         
         # 2. Loop over timesteps
-        # We need to run the scheduler loop exactly as PyTorch does
-        # But wait, inference_stream usually runs ONE step per frame?
-        # No, diffusion runs MULTIPLE steps (denoising_step_list) per streaming chunk.
-        # But `inference_stream` implementation iterates `self.scheduler.timesteps`.
-        
-        if current_step is None:
-             # First call for this chunk?
-             pass
-             
         for t in scheduler.timesteps:
             # Create timestep tensor
-            t_tensor = torch.full((B, F), t, device=self.device, dtype=torch.long)
+            t_tensor = torch.full((1, F), t, device=self.device, dtype=torch.long)
             
-            # Call TRT Engine
-            # output, new_cache = engine(...)
-            flow_pred, new_kv_cache = self.dit_engine(
-                noisy_image, t_tensor, prompt_embeds, grid_sizes,
-                self.trt_kv_cache, current_start_t, current_end_t
-            )
+            # Determine batch size from prompts (usually B=2 for CFG)
+            B_text = prompt_embeds.shape[0]
             
-            # Update cache reference (if new tensor returned)
-            # Actually, because we passed trt_kv_cache and got new_kv_cache
-            # we should update self.trt_kv_cache.
-            # However, if using IOBinding with inplace optimization, they might point to same buffer.
-            # But strictly:
-            self.trt_kv_cache = new_kv_cache
+            # Handle CFG disable/enable mismatch
+            if not self.enable_cfg and B_text > 1:
+                # User disabled CFG to save memory, but text encoder returned 2 embeds
+                # We slice to keep only the conditional prompt (index 1 usually, check impl)
+                # Actually usually [neg, pos]. We want pos.
+                # Assuming index 1 is positive prompt for standard SD pipes.
+                prompt_embeds = prompt_embeds[1:2]
+                B_text = 1
+            
+            # Prepare inputs for batch splitting if B_text > 1
+            if B_text > 1:
+                flow_preds = []
+                # Process each batch item sequentially to fit in B=1 engine
+                for b_idx in range(B_text):
+                    # Slice inputs
+                    img_idx = b_idx if B > 1 else 0
+                    img_slice = noisy_image[img_idx:img_idx+1, -1:, ...] # [1, 1, C, H, W]
+                    
+                    t_slice = t_tensor # [1, F]
+                    prompt_slice = prompt_embeds[b_idx:b_idx+1] # [1, L, D]
+                    
+                    # Correct slicing for current_start (Batch dim is 0)
+                    start_slice = current_start_t[0:1] # [1]
+                    
+                    # Get list of cache chunks for this batch index
+                    # self.trt_kv_cache is List[List[Tensor]] -> [Batch][Chunk]
+                    cache_chunks = self.trt_kv_cache[b_idx]
+                    
+                    # Call Engine with list of chunks
+                    flow_out, _ = self.dit_engine(
+                        img_slice, t_slice, prompt_slice, 
+                        cache_chunks, start_slice
+                    )
+                    flow_preds.append(flow_out)
+                    
+                flow_pred = torch.cat(flow_preds, dim=0)
+            else:
+                # Single batch run
+                t_tensor_b = torch.full((B, 1), t, device=self.device, dtype=torch.long)
+                
+                # Get chunks for batch 0
+                cache_chunks = self.trt_kv_cache[0]
+                img_slice = noisy_image[:, -1:, ...]
+                
+                flow_pred, _ = self.dit_engine(
+                    img_slice, t_tensor_b, prompt_embeds,
+                    cache_chunks, current_start_t
+                )
             
             # Convert flow to x0 (PyTorch logic)
-            # flow_pred is [B, C, F, H, W] (from engine output) needs float32 for scheduler?
             flow_pred = flow_pred.float()
             
-            # Helper to convert (from wan_wrapper.py logic)
-            # We need to replicate _convert_flow_pred_to_x0 logic
-            # x0 = x_t - flow * sigma
-            # We need sigmas.
-            
             # Retrieve sigmas from scheduler
-            # scheduler.sigmas is used in wrapper.
-            # We need the sigma for THIS timestep.
-            # This logic is buried in wrapper forward.
-            
-            # wrapper logic:
-            # timestep_id = argmin(abs(timesteps - t))
-            # sigma = sigmas[timestep_id]
-            # flow = (xt - x0) / sigma => x0 = xt - flow * sigma ??
-            # Wait, wrapper code: 
-            #   flow_pred = (xt - x0_pred) / sigma_t  <-- returned by model if target is flow?
-            #   pred_x0 = x0_pred
-            # Actually, `model` returns `output`.
-            # If `flow_prediction`, output IS flow.
-            # flow = output.
-            # x0 = xt - output * sigma
-            
-            # Let's check scheduler directly
             step_index = (scheduler.timesteps == t).nonzero().item()
             sigma = scheduler.sigmas[step_index]
             
@@ -262,21 +357,7 @@ class TRTAcceleratedInferencePipeline:
             pred_x0 = noisy_image.float() - flow_pred * sigma
             
             # Scheduler step
-            # self.scheduler.step(pred_x0, t, noisy_image)
-            # But `inference_stream` uses `self.scheduler.step_stream`.
-            # We rely on PyTorch scheduler
-            
-            # Original code:
-            # pred = self.generator(...) -> returns pred_x0
-            # self.scheduler.step_stream(pred, t, noise)
-            
             scheduler.step_stream(pred_x0, t, noise)
-            
-            # noise is updated in-place by step_stream?
-            # Check `causal_stream_inference.py`:
-            #   self.scheduler.step_stream(pred, t, noise)
-            #   # noise is modified?
-            #   # Actually, noise is passed as argument `noise` to function.
             
         return pred_x0.to(torch.bfloat16)
     
@@ -350,6 +431,12 @@ class TRTAcceleratedInferencePipeline:
             current_start = current_end
             current_end = current_end + (chunk_size // 4) * self.pytorch_pipeline.frame_seq_length
             
+            # Check for cache overflow
+            if current_end >= self.max_seq_len:
+                logger.error(f"Cache Overflow! Current end {current_end} > Max {self.max_seq_len}")
+                logger.error("Stopping generation to prevent crash. Reduce frames or disable CFG.")
+                break
+            
             if input_video is not None and end_idx <= input_video.shape[2]:
                 inp = input_video[:, :, start_idx:end_idx]
                 
@@ -407,7 +494,12 @@ class TRTAcceleratedInferencePipeline:
                 start_time = end_time
         
         # Save video
-        video_list = [results[i] for i in range(num_chunks)]
+        # Use only valid results
+        video_list = [results[i] for i in range(save_results)]
+        if not video_list:
+            logger.error("No frames generated!")
+            return
+
         video = np.concatenate(video_list, axis=0)
         fps_avg = np.mean(np.array(fps_list)) if fps_list else 0
         
@@ -434,6 +526,14 @@ def main():
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type")
+    
+    # New args
+    parser.add_argument("--guidance_scale", type=float, default=5.0, help="CFG scale. Set to 1.0 to save memory.")
+    parser.add_argument("--max_seq_len", type=int, default=130000, help="Max cache sequence length (supports ~81 frames at 480x832).")
+    parser.add_argument("--num_kv_cache", type=int, default=8, help="Number of cache blocks.")
+    parser.add_argument("--num_sink_tokens", type=int, default=0, help="Number of sink tokens.")
+    parser.add_argument("--adapt_sink_threshold", type=float, default=0.0, help="Threshold for adaptive sink.")
+    
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
@@ -465,10 +565,14 @@ def main():
         t = args.num_frames
     
     # Create pipeline
+    enable_cfg = args.guidance_scale != 1.0
+    
     pipeline = TRTAcceleratedInferencePipeline(
         config=config,
         dit_engine_path=args.dit_engine_path,
         device=device,
+        max_seq_len=args.max_seq_len,
+        enable_cfg=enable_cfg,
     )
     pipeline.load_model(args.checkpoint_folder)
     

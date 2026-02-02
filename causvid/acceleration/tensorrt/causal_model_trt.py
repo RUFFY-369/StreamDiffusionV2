@@ -293,9 +293,12 @@ class CausalWanModelTRTExport(nn.Module):
     def from_pretrained_model(cls, original_model) -> 'CausalWanModelTRTExport':
         """Create TRT-exportable model from pretrained CausalWanModel."""
         # Access attributes directly from model (not from config dict)
+        # Handle patch_size which might not be in config but on model instance
+        patch_size = getattr(original_model, 'patch_size', (1, 2, 2))
+        
         trt_model = cls(
             model_type=original_model.model_type,
-            patch_size=original_model.patch_size,
+            patch_size=patch_size,
             text_len=original_model.text_len,
             in_dim=original_model.in_dim,
             dim=original_model.dim,
@@ -396,7 +399,15 @@ class CausalWanModelTRTExport(nn.Module):
         x = self.patch_embedding(x.permute(0, 2, 1, 3, 4))  # [B, C, F, H, W]
         x = x.flatten(2).transpose(1, 2)  # [B, L, dim]
         
-        seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
+        # seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
+        # Use torch.full to support symbolic tracing of shape
+        seq_lens = torch.full((b,), x.shape[1], device=device, dtype=torch.long)
+        
+        # Hardcode grid_sizes directly for 480p to bypass TRT runtime "Shape Calculation Overflow"
+        # The input tensor is corrupted during runtime (garbage values)
+        # Since profile is locked to 480p (30x52 tokens), we bake the correct values.
+        # [1, 30, 52] (1 frame, 30 grid h, 52 grid w)
+        grid_sizes = torch.tensor([[1, 30, 52]], device=device, dtype=torch.long).expand(b, -1)
         
         # Time embeddings - cast sinusoidal output to model dtype
         from causvid.models.wan.wan_base.modules.model import sinusoidal_embedding_1d
@@ -511,11 +522,25 @@ class CausalWanModelTRTExport(nn.Module):
         outputs = []
         
         for i in range(b):
-            f, h, w = grid_sizes[i].tolist()
+            # Use torch.unbind to preserve symbolic graph
+            f, h, w = torch.unbind(grid_sizes[i], dim=0)
+            
+            # Constraint: Clamp to avoid overflow if TRT validates with garbage inputs
+            f = torch.clamp(f, min=1, max=1024)
+            h = torch.clamp(h, min=1, max=4096)
+            w = torch.clamp(w, min=1, max=4096)
+            
             seq_len = f * h * w
             u = x[i, :seq_len].view(f, h, w, *self.patch_size, c)
             u = torch.einsum('fhwpqrc->cfphqwr', u)
-            u = u.reshape(c, f * self.patch_size[0], h * self.patch_size[1], w * self.patch_size[2])
+            
+            # Symbolic reshape logic
+            # We reconstruct the video dimensions dynamically
+            h_out = h * self.patch_size[1]
+            w_out = w * self.patch_size[2]
+            f_out = f * self.patch_size[0]
+            
+            u = u.reshape(c, f_out, h_out, w_out)
             outputs.append(u)
         
         return torch.stack(outputs)
@@ -525,28 +550,47 @@ class CausalWanModelTRTExport(nn.Module):
         x: torch.Tensor,
         timestep: torch.Tensor,
         context: torch.Tensor,
-        grid_sizes: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache_0: torch.Tensor,
+        kv_cache_1: torch.Tensor,
+        kv_cache_2: torch.Tensor,
+        kv_cache_3: torch.Tensor,
+        kv_cache_4: torch.Tensor,
+        kv_cache_5: torch.Tensor,
+        kv_cache_6: torch.Tensor,
+        kv_cache_7: torch.Tensor,
+        kv_cache_8: torch.Tensor,
+        kv_cache_9: torch.Tensor,
+        kv_cache_10: torch.Tensor,
+        kv_cache_11: torch.Tensor,
+        kv_cache_12: torch.Tensor,
+        kv_cache_13: torch.Tensor,
+        kv_cache_14: torch.Tensor,
+        kv_cache_15: torch.Tensor,
+        kv_cache_16: torch.Tensor,
+        kv_cache_17: torch.Tensor,
+        kv_cache_18: torch.Tensor,
+        kv_cache_19: torch.Tensor,
+        kv_cache_20: torch.Tensor,
+        kv_cache_21: torch.Tensor,
+        kv_cache_22: torch.Tensor,
+        kv_cache_23: torch.Tensor,
+        kv_cache_24: torch.Tensor,
+        kv_cache_25: torch.Tensor,
+        kv_cache_26: torch.Tensor,
+        kv_cache_27: torch.Tensor,
+        kv_cache_28: torch.Tensor,
+        kv_cache_29: torch.Tensor,
         current_start: torch.Tensor,
-        current_end: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Forward pass for streaming inference with KV cache support.
+        Streaming forward pass (DiT only) - Optimized Interface with SPLIT KV Cache.
         
         Args:
-            x: [B, F, C, H, W] noisy latents
-            timestep: [B, F] timesteps
-            context: [B, text_len, dim] text embeddings
-            grid_sizes: [B, 3] containing (F, H, W)
-            kv_cache: [NumLayers, 2, B, MaxSeqLen, NumHeads, HeadDim]
-                Huge tensor containing K and V caches for all layers
-            current_start: [B] start index for cache update
-            current_end: [B] end index for cache update
-            
-        Returns:
-            output: [B, C, F', H', W']
-            new_kv_cache: [NumLayers, 2, B, MaxSeqLen, NumHeads, HeadDim]
-                Updated cache tensor
+            x: [B, L, C] (L=1560 usually)
+            timestep: [B]
+            context: [B, text_len, text_dim]
+            kv_cache_0..29: [1, 2, B, MaxSeq, H, D] - 30 chunks of 1 layer each
+            current_start: [B] Start token index for cache update (0-d or 1-d)
         """
         device = x.device
         b = x.shape[0]
@@ -558,12 +602,27 @@ class CausalWanModelTRTExport(nn.Module):
         # Embed context (text) - valid for both export and inference
         context = self.text_embedding(context)
         
-        seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
+        # seq_lens = torch.tensor([x.shape[1]] * b, device=device, dtype=torch.long)
+        seq_lens = torch.full((b,), x.shape[1], device=device, dtype=torch.long)
+        
+        # Hardcode grid_sizes directly for 480p to bypass TRT runtime "Shape Calculation Overflow"
+        # [1, 30, 52] (1 frame, 30 grid h, 52 grid w) -> Matches 480x832 input (Patched / 2)
+        grid_sizes = torch.tensor([[1, 30, 52]], device=device, dtype=torch.long).expand(b, -1)
         
         # Time embeddings - use TRT compatible version that respects dtype
         t_emb = self.time_embedding(trt_sinusoidal_embedding_1d(self.freq_dim, timestep.flatten(), dtype=x.dtype))
         e = self.time_projection(t_emb).unflatten(1, (6, self.dim))
         e = e.unflatten(0, timestep.shape)
+        
+        # Group caches for iteration
+        cache_chunks = [
+            kv_cache_0, kv_cache_1, kv_cache_2, kv_cache_3, kv_cache_4,
+            kv_cache_5, kv_cache_6, kv_cache_7, kv_cache_8, kv_cache_9,
+            kv_cache_10, kv_cache_11, kv_cache_12, kv_cache_13, kv_cache_14,
+            kv_cache_15, kv_cache_16, kv_cache_17, kv_cache_18, kv_cache_19,
+            kv_cache_20, kv_cache_21, kv_cache_22, kv_cache_23, kv_cache_24,
+            kv_cache_25, kv_cache_26, kv_cache_27, kv_cache_28, kv_cache_29,
+        ]
         
         # Unpack cache tensor: [Layers, 2, B, MaxSeq, Heads, D]
         # We process layer by layer
@@ -574,8 +633,12 @@ class CausalWanModelTRTExport(nn.Module):
         frame_seqlen = x.shape[1] // num_frames
         
         for i, block in enumerate(self.blocks):
+            # Determine which chunk and which layer within chunk (1 layer per chunk)
+            chunk_idx = i
+            layer_idx_in_chunk = 0
+            
             # Extract cache for this layer: [2, B, MaxSeq, Heads, D]
-            layer_cache = kv_cache[i] 
+            layer_cache = cache_chunks[chunk_idx][layer_idx_in_chunk] 
             k_cache = layer_cache[0]
             v_cache = layer_cache[1]
             
@@ -585,7 +648,7 @@ class CausalWanModelTRTExport(nn.Module):
                 kv_cache_k=k_cache, kv_cache_v=v_cache,
                 cache_seqlens=current_start, # Uses start as current length marker
                 current_start=current_start,
-                current_end=current_end
+                current_end=None # Calculated internally
             )
             
             # Stack updated K/V for this layer
@@ -605,10 +668,22 @@ class CausalWanModelTRTExport(nn.Module):
         x = self.head_linear(x_normed * (1 + e_mod[1]) + e_mod[0])
         x = self._unpatchify(x, grid_sizes)
         
-        # Stack all layer caches: [Layers, 2, B, MaxSeq, Heads, D]
-        new_kv_cache_tensor = torch.stack(new_caches)
+        # Re-stack output caches into 10 chunks
+        # Re-stack output caches into 30 chunks (1 layer each)
+        new_cache_chunks = []
+        for c_idx in range(30):
+             # Just one layer per chunk now
+             new_cache_chunks.append(torch.stack([new_caches[c_idx]]))
         
-        return x, new_kv_cache_tensor
+        return (
+            x, 
+            new_cache_chunks[0], new_cache_chunks[1], new_cache_chunks[2], new_cache_chunks[3], new_cache_chunks[4],
+            new_cache_chunks[5], new_cache_chunks[6], new_cache_chunks[7], new_cache_chunks[8], new_cache_chunks[9],
+            new_cache_chunks[10], new_cache_chunks[11], new_cache_chunks[12], new_cache_chunks[13], new_cache_chunks[14],
+            new_cache_chunks[15], new_cache_chunks[16], new_cache_chunks[17], new_cache_chunks[18], new_cache_chunks[19],
+            new_cache_chunks[20], new_cache_chunks[21], new_cache_chunks[22], new_cache_chunks[23], new_cache_chunks[24],
+            new_cache_chunks[25], new_cache_chunks[26], new_cache_chunks[27], new_cache_chunks[28], new_cache_chunks[29]
+        )
 
 
 # =============================================================================

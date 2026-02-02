@@ -86,10 +86,28 @@ def trt_rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tenso
     
     output = []
     for i in range(b):
-        f, h, w = grid_sizes[i].tolist()
-        actual_seq_len = int(f * h * w)
+        # Use torch.unbind to preserve symbolic graph (avoid .tolist())
+        # grid_sizes is [B, 3], so grid_sizes[i] is [3]
+        f, h, w = torch.unbind(grid_sizes[i], dim=0)
         
-        # Get the relevant portion and convert to float32 for precision
+        # Calculate seq len symbolically
+        # Note: We cast to int for slicing, but slicing with specialized tensors usually works in TRT dynamic shapes
+        # However, for looping in Python, we need values.
+        # But here we are tracing.
+        # Ideally, we used batch-aware ops, but loop is fine if B is small (1).
+        
+        # For tracing, slicing with tensor variables can be tricky.
+        # But converting to int (.item()) BAKES the value.
+        # We must keep it as tensor if possible, or assume it matches.
+        
+        # ACTUALLY: For TRT + ONNX, if we loop over B, and B is known (optimization profile), it unrolls.
+        # But 'f', 'h', 'w' MUST be tensors to be dynamic.
+        # If we slice x[i, :f*h*w], PyTorch ONNX exporter handles dynamic slice.
+        
+        actual_seq_len = f * h * w
+        
+        # Get the relevant portion
+        # We use dynamic slicing
         x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
         # Build frequency tensor for this sample
@@ -150,9 +168,15 @@ def trt_causal_rope_apply(
     
     output = []
     for i in range(b):
-        f, h, w = grid_sizes[i].tolist()
-        actual_seq_len = int(f * h * w)
-        sf = int(start_frame[i].item()) if isinstance(start_frame, torch.Tensor) else int(start_frame)
+        f, h, w = torch.unbind(grid_sizes[i], dim=0)
+        actual_seq_len = f * h * w
+        
+        # start_frame should be tensor
+        sf = start_frame[i]
+        
+        # Casting to int for Slicing indices:
+        # If we use tensors for slicing: freqs[sf:sf+f]
+        # PyTorch supports this in export.
         
         x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
@@ -253,9 +277,11 @@ class TRTCausalSelfAttention(nn.Module):
         n, d = self.num_heads, self.head_dim
         
         # Compute Q, K, V
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        # Compute Q, K, V
+        # Use -1 for sequence length to ensure dynamic reshaping in ONNX
+        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        k = self.norm_k(self.k(x)).view(b, -1, n, d)
+        v = self.v(x).view(b, -1, n, d)
         
         # Apply RoPE
         if kv_cache_k is None:
@@ -264,7 +290,11 @@ class TRTCausalSelfAttention(nn.Module):
             k = trt_rope_apply(k, grid_sizes, freqs)
         else:
             # Streaming: offset RoPE based on current position
-            frame_seqlen = grid_sizes[0, 1].item() * grid_sizes[0, 2].item()
+            # Ensure frame_seqlen is tensor
+            grid_i = grid_sizes[0] # Assume B=1 or same grid
+            frame_seqlen = grid_i[1] * grid_i[2]
+            
+            # Symbolic division
             start_frame = current_start // frame_seqlen
             q = trt_causal_rope_apply(q, grid_sizes, freqs, start_frame)
             k = trt_causal_rope_apply(k, grid_sizes, freqs, start_frame)
@@ -353,7 +383,9 @@ class TRTCausalSelfAttention(nn.Module):
             )
         
         # Reshape back: [B, L, C]
-        out = out.transpose(1, 2).contiguous().view(b, s, -1)
+        # Reshape back: [B, L, C]
+        # Use -1 for sequence length
+        out = out.transpose(1, 2).contiguous().view(b, -1, self.dim)
         out = self.o(out)
         
         return out, new_kv_cache_k, new_kv_cache_v
@@ -429,7 +461,8 @@ class TRTCrossAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         
         # Reshape back
-        out = out.transpose(1, 2).contiguous().view(b, s, -1)
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(b, -1, self.dim)
         out = self.o(out)
         
         # Return with cache (transposed back)

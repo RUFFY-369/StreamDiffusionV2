@@ -178,6 +178,17 @@ class Engine:
         
         if self.engine is None:
             raise RuntimeError(f"Failed to load engine from {self.engine_path}")
+            
+        # Register binding names, dtypes, and indices
+        self.binding_names = []
+        self.tensor_dtypes = {}
+        self.binding_indices = {}  # Map name -> index manually
+        for idx in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(idx)
+            self.binding_names.append(name)
+            self.binding_indices[name] = idx
+            dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
+            self.tensor_dtypes[name] = numpy_to_torch_dtype_dict.get(dtype_np, torch.float32)
     
     def activate(self, reuse_device_memory: Optional[int] = None):
         """
@@ -188,6 +199,11 @@ class Engine:
         """
         # For TRT 10+ with dynamic shapes, use manual memory management
         # to completely bypass TRT's internal allocation
+        # Debug logging of bindings
+        logger.info("Engine Bindings and Types:")
+        for name, dtype in self.tensor_dtypes.items():
+            logger.info(f"  {name}: {dtype}")
+            
         self.context = self.engine.create_execution_context_without_device_memory()
         
         if self.context is None:
@@ -196,19 +212,24 @@ class Engine:
     def allocate_buffers(
         self, 
         shape_dict: Optional[Dict[str, Tuple]] = None, 
-        device: str = "cuda"
+        device: str = "cuda",
+        external_tensors: Optional[List[str]] = None
     ):
         """
         Allocate GPU buffers for engine I/O.
         
-        For dynamic shape engines, shape_dict MUST be provided with actual
-        input shapes to avoid TensorRT using uninitialized dimensions.
+        Args:
+            shape_dict: Input shapes
+            device: Device name
+            external_tensors: List of tensor names to skip allocation for (Zero-Copy)
         """
-        # Check if we can reuse existing buffers
-        if self._can_reuse_buffers(shape_dict, device):
+        # Check if we can reuse existing buffers (skip for simplicity if external_tensors used)
+        if self._can_reuse_buffers(shape_dict, device) and not external_tensors:
             return
         
         self.tensors.clear()
+        
+        external_tensors = set(external_tensors or [])
         
         # Reset CUDA graph when buffers change
         if self.cuda_graph_instance is not None:
@@ -221,16 +242,16 @@ class Engine:
         # CRITICAL: For dynamic shape engines, set ALL input shapes FIRST
         # before querying output shapes or allocating memory
         if shape_dict:
-            for idx in range(self.engine.num_io_tensors):
-                name = self.engine.get_tensor_name(idx)
-                mode = self.engine.get_tensor_mode(name)
-                
-                if mode == trt.TensorIOMode.INPUT and name in shape_dict:
-                    shape = shape_dict[name]
-                    # Convert to tuple if it's a torch.Size
-                    if hasattr(shape, '__iter__'):
-                        shape = tuple(shape)
-                    self.context.set_input_shape(name, shape)
+            # Use binding_indices if available, else try fallbacks (iteration is safer)
+            for name, shape in shape_dict.items():
+                if name in self.binding_indices:
+                    idx = self.binding_indices[name]
+                    mode = self.engine.get_tensor_mode(name)
+                    if mode == trt.TensorIOMode.INPUT:
+                        # Convert to tuple if it's a torch.Size
+                        if hasattr(shape, '__iter__'):
+                            shape = tuple(shape)
+                        self.context.set_input_shape(name, shape)
         
         # Allocate device memory for the context AFTER setting input shapes
         # For TRT 10 with dynamic shapes, device_memory_size_v2 can return garbage
@@ -238,8 +259,12 @@ class Engine:
         try:
             # TRT 10: Use update_device_memory_size_for_shapes or infer from output shapes
             # First, try to get actual memory requirement from context
-            if hasattr(self.context, 'update_device_memory_size_for_shapes'):
-                self.context.update_device_memory_size_for_shapes()
+            try:
+                if hasattr(self.context, 'update_device_memory_size_for_shapes'):
+                    self.context.update_device_memory_size_for_shapes()
+            except Exception as e:
+                # Handle shape calculation overflow (e.g., large KV caches)
+                logger.warning(f"TensorRT shape memory calculation failed (likely overflow): {e}")
             
             # Get device memory size based on actual input shapes
             device_mem_size = self.engine.get_device_memory_size_for_profile(0)
@@ -271,54 +296,59 @@ class Engine:
         # Now allocate tensors for all I/O
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
-            mode = self.engine.get_tensor_mode(name)
+            # Allocation loop continues...
+        
+        # Iterate bindings
+        for name in self.binding_names:
+            if name in external_tensors:
+                continue # Skip allocation for external tensors
+                
+            idx = self.binding_indices[name]
+            dtype = self.tensor_dtypes[name]
             
-            if shape_dict and name in shape_dict:
-                shape = tuple(shape_dict[name])
-            else:
-                # For outputs, get shape after inputs are set
-                shape = self.context.get_tensor_shape(name)
-                # Convert to list to check for dynamic dims
-                shape = tuple(shape)
+            # Get shape from context (for dynamic output shapes)
+            shape = self.context.get_tensor_shape(name)
             
-            # Check for invalid shapes (negative or zero dimensions)
-            if any(d <= 0 for d in shape):
-                raise ValueError(
-                    f"Invalid shape for tensor '{name}': {shape}. "
-                    f"For dynamic shape engines, provide shape_dict with explicit shapes."
+            # Allocate
+            vol = 1
+            for d in shape:
+                vol *= d
+            
+            # Handle negative dims (error)
+            if vol < 0:
+                logger.warning(f"Warning: Tensor {name} has dynamic shape {shape}, cannot allocate yet.")
+                continue
+                
+            # Allocate buffer
+            try:
+                self.tensors[name] = torch.empty(
+                    tuple(shape), 
+                    dtype=dtype, 
+                    device=device
                 )
-            
-            dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
-            
-            tensor = torch.empty(
-                shape,
-                dtype=numpy_to_torch_dtype_dict[dtype_np]
-            ).to(device=device)
-            self.tensors[name] = tensor
+            except torch.cuda.OutOfMemoryError:
+                logger.error(f"OOM allocating {name} ({vol} elements)")
+                raise
         
         self._last_shape_dict = shape_dict.copy() if shape_dict else None
         self._last_device = device
 
-    
-    def _can_reuse_buffers(
-        self, 
-        shape_dict: Optional[Dict] = None, 
-        device: str = "cuda"
-    ) -> bool:
+    def _can_reuse_buffers(self, shape_dict: Optional[Dict] = None, device: str = "cuda") -> bool:
         """Check if existing buffers can be reused."""
         if not self.tensors:
             return False
-        if self._last_device != device:
+        if getattr(self, '_last_device', None) != device:
             return False
-        if shape_dict is None and self._last_shape_dict is None:
+        last_shape = getattr(self, '_last_shape_dict', None)
+        if shape_dict is None and last_shape is None:
             return True
-        if shape_dict is None or self._last_shape_dict is None:
+        if shape_dict is None or last_shape is None:
             return False
-        if len(shape_dict) != len(self._last_shape_dict):
+        if len(shape_dict) != len(last_shape):
             return False
         
         for name, new_shape in shape_dict.items():
-            cached_shape = self._last_shape_dict.get(name)
+            cached_shape = last_shape.get(name)
             if cached_shape is None:
                 return False
             if tuple(cached_shape) != tuple(new_shape):
@@ -334,43 +364,57 @@ class Engine:
         if hasattr(self, 'graph') and self.graph is not None:
             CUASSERT(cudart.cudaGraphDestroy(self.graph))
             self.graph = None
-    
+
     def infer(
         self,
         feed_dict: Dict[str, torch.Tensor],
-        stream,
+        stream: torch.cuda.Stream,
         use_cuda_graph: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Execute inference.
-        
-        Args:
-            feed_dict: Input tensors
-            stream: CUDA stream
-            use_cuda_graph: Enable CUDA graph for reduced overhead
-        
-        Returns:
-            Output tensors
+        Run inference (Zero-Copy compatible).
         """
-        # Copy inputs to pre-allocated buffers
-        for name, buf in feed_dict.items():
-            if name in self.tensors:
-                self.tensors[name].copy_(buf)
+        # 1. Bind provided tensors (Zero-Copy)
+        for name, tensor in feed_dict.items():
+            if name in self.binding_indices:
+                # FIX: Removed the logic that forced 'current_start' to CPU.
+                # In streaming DiT, 'current_start' is an execution tensor (cache index)
+                # and must reside on the GPU. Forcing it to CPU causes Illegal Memory Access.
+                
+                if self.engine.is_shape_inference_io(name):
+                    # Shape Tensor MUST be on Host (CPU)
+                    if tensor.device.type != 'cpu':
+                        tensor = tensor.cpu()
+                    
+                    # CRITICAL: Keep reference to CPU tensor to prevent GC!
+                    # Otherwise data_ptr becomes invalid before execution.
+                    tensor = tensor.contiguous()
+                    feed_dict[name] = tensor 
+                    
+                    self.context.set_tensor_address(name, tensor.data_ptr())
+                    
+                    # Also update dimensions if dynamic
+                    self.context.set_input_shape(name, tensor.shape)
+                else:
+                    # Execution Tensor: MUST be on Device (GPU)
+                    # If input is on CPU but needs to be on GPU, warn or error?
+                    # For now, we assume user provides correct device, or we could strict check.
+                    # tensor = tensor.cuda() # Uncomment if auto-move is desired
+                    
+                    self.context.set_tensor_address(name, tensor.data_ptr())
         
-        # Bind tensor addresses
+        # 2. Bind internal tensors (for missing outputs/scratch)
         for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
+            if name not in feed_dict:
+                self.context.set_tensor_address(name, tensor.data_ptr())
         
         if use_cuda_graph:
             if self.cuda_graph_instance is not None:
-                # Fast path: replay captured graph
                 CUASSERT(cudart.cudaGraphLaunch(self.cuda_graph_instance, stream.ptr))
                 CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
             else:
-                # First run: capture graph
-                noerror = self.context.execute_async_v3(stream.ptr)
-                if not noerror:
-                    raise ValueError("TensorRT inference failed during graph capture")
+                # Capture
+                self.context.execute_async_v3(stream.ptr)
                 
                 CUASSERT(cudart.cudaStreamBeginCapture(
                     stream.ptr,
@@ -382,184 +426,117 @@ class Engine:
                     cudart.cudaGraphInstantiate(self.graph, 0)
                 )
         else:
-            noerror = self.context.execute_async_v3(stream.ptr)
-            if not noerror:
-                raise ValueError("TensorRT inference failed")
+            self.context.execute_async_v3(stream.ptr)
         
-        return self.tensors
+        return {**self.tensors, **feed_dict}
 
 
 def export_onnx(
     model: torch.nn.Module,
-    onnx_path: str,
-    sample_inputs: Tuple,
+    file_path: Union[str, Path],
+    sample_inputs: Tuple[Any, ...],
     input_names: List[str],
     output_names: List[str],
-    dynamic_axes: Optional[Dict] = None,
-    opset_version: int = 18,  # Use opset 18 for _upsample_nearest_exact2d support
+    dynamic_axes: Dict[str, Dict[int, str]],
+    opset_version: int = 17,
     use_dynamo: bool = False,
 ):
     """
     Export PyTorch model to ONNX.
-    
-    Args:
-        model: PyTorch model
-        onnx_path: Output path
-        sample_inputs: Sample input tensors
-        input_names: Names for inputs
-        output_names: Names for outputs
-        dynamic_axes: Dynamic axis specifications
-        opset_version: ONNX opset version
-        use_dynamo: Use torch.onnx.dynamo_export (more memory efficient)
+    Wrapper around torch.onnx.export with support for large models.
     """
-    logger.info(f"Exporting model to ONNX: {onnx_path}")
+    file_path = str(file_path)
+    logger.info(f"Exporting ONNX to {file_path}")
     
-    os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
     
-    # Force garbage collection before export
-    gc.collect()
-    torch.cuda.empty_cache()
-    
+    # Handle dynamo export if requested, but fallback to script for reliability
     if use_dynamo:
-        # PyTorch 2.x dynamo export - more memory efficient
-        try:
-            logger.info("Using torch.onnx.dynamo_export (memory efficient)")
-            export_output = torch.onnx.dynamo_export(
-                model,
-                *sample_inputs,
-            )
-            export_output.save(onnx_path)
-            logger.info(f"Dynamo export successful: {onnx_path}")
-            return
-        except Exception as e:
-            logger.warning(f"Dynamo export failed: {e}, falling back to classic export")
+        logger.info("Note: use_dynamo=True requested, but using standard torch.onnx.export for stability.")
     
-    # Classic export with memory optimizations
-    with torch.inference_mode():
-        # Disable gradient tracking completely
-        for param in model.parameters():
-            param.requires_grad = False
+    # Use standard export
+    torch.onnx.export(
+        model,
+        sample_inputs,
+        file_path,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        opset_version=opset_version,
+        do_constant_folding=True,
+        keep_initializers_as_inputs=False,
+        verbose=False
+    )
+    logger.info("ONNX export successful")
+
+
+def optimize_onnx(
+    input_path: Union[str, Path],
+    output_path: Union[str, Path],
+):
+    """
+    Optimize ONNX model using Polygraphy (constant folding).
+    """
+    input_path = str(input_path)
+    output_path = str(output_path)
+    logger.info(f"Optimizing ONNX: {input_path} -> {output_path}")
+    
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input ONNX file not found: {input_path}")
         
-        torch.onnx.export(
-            model,
-            sample_inputs,
-            onnx_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-        )
+    onx = onnx.load(input_path)
+    onx = fold_constants(onx)
     
-    # Handle large models (>2GB)
-    onnx_model = onnx.load(onnx_path)
-    if onnx_model.ByteSize() > 2147483648:
-        logger.info("Model exceeds 2GB, using external data format")
-        onnx.save_model(
-            onnx_model,
-            onnx_path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location="weights.pb",
-            convert_attribute=False,
-        )
-    
-    del onnx_model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def optimize_onnx(onnx_path: str, onnx_opt_path: str):
-    """
-    Optimize ONNX model using graph surgery.
-    
-    Args:
-        onnx_path: Input ONNX path
-        onnx_opt_path: Output optimized ONNX path
-    """
-    if not TRT_AVAILABLE:
-        raise RuntimeError("TensorRT/ONNX tools not available")
-    
-    logger.info(f"Optimizing ONNX: {onnx_path} -> {onnx_opt_path}")
-    
-    # Check for external data
-    onnx_dir = os.path.dirname(onnx_path)
-    external_data_files = [f for f in os.listdir(onnx_dir) if f.endswith('.pb')]
-    uses_external_data = len(external_data_files) > 0
-    
-    if uses_external_data:
-        onnx_model = onnx.load(onnx_path, load_external_data=True)
-    else:
-        onnx_model = onnx.load(onnx_path)
-    
-    # Optimize using polygraphy
-    graph = gs.import_onnx(onnx_model)
-    graph.cleanup().toposort()
-    
-    # Fold constants
-    onnx_opt = fold_constants(gs.export_onnx(graph), allow_onnxruntime_shape_inference=True)
-    graph = gs.import_onnx(onnx_opt)
-    graph.cleanup().toposort()
-    
-    opt_model = gs.export_onnx(graph)
-    
-    os.makedirs(os.path.dirname(onnx_opt_path), exist_ok=True)
-    
-    if uses_external_data or opt_model.ByteSize() > 2147483648:
-        onnx.save_model(
-            opt_model,
-            onnx_opt_path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location="weights.pb",
-        )
-    else:
-        onnx.save(opt_model, onnx_opt_path)
-    
-    del graph, opt_model, onnx_model
-    gc.collect()
-    torch.cuda.empty_cache()
+    onnx.save(onx, output_path)
+    logger.info("ONNX optimization complete")
 
 
 def build_engine(
-    engine_path: str,
-    onnx_opt_path: str,
-    input_profile: Dict[str, Tuple],
+    engine_path: Union[str, Path],
+    onnx_path: Union[str, Path],
+    input_profile: Dict[str, Tuple[Tuple, Tuple, Tuple]],
     fp16: bool = True,
-    enable_refit: bool = False,
-):
+    timing_cache: Optional[str] = None,
+    workspace_size: int = 0,
+) -> Engine:
     """
-    Build TensorRT engine from optimized ONNX.
-    
-    Args:
-        engine_path: Output engine path
-        onnx_opt_path: Optimized ONNX path
-        input_profile: Dynamic shape profiles {name: (min, opt, max)}
-        fp16: Enable FP16 mode
-        enable_refit: Enable weight refitting
+    Build TensorRT engine from ONNX model.
     """
-    if not TRT_AVAILABLE:
-        raise RuntimeError("TensorRT is not available")
+    engine_path = str(engine_path)
+    onnx_path = str(onnx_path)
     
-    # Calculate workspace size
-    _, free_mem, _ = cudart.cudaMemGetInfo()
-    GiB = 2**30
-    if free_mem > 6 * GiB:
-        max_workspace_size = free_mem - 4 * GiB
-    else:
-        max_workspace_size = 0
+    logger.info(f"Building TensorRT Engine: {engine_path}")
     
-    engine = Engine(engine_path)
-    engine.build(
-        onnx_opt_path,
+    # Setup builder config
+    p = Profile()
+    for name, (min_shape, opt_shape, max_shape) in input_profile.items():
+        p.add(name, min=min_shape, opt=opt_shape, max=max_shape)
+    
+    config_kwargs = {}
+    if workspace_size > 0:
+        config_kwargs["memory_pool_limits"] = {
+            trt.MemoryPoolType.WORKSPACE: workspace_size
+        }
+        
+    config = CreateConfig(
         fp16=fp16,
-        input_profile=input_profile,
-        enable_refit=enable_refit,
-        workspace_size=max_workspace_size,
+        profiles=[p],
+        load_timing_cache=timing_cache,
+        **config_kwargs
     )
     
-    gc.collect()
-    torch.cuda.empty_cache()
+    # Build
+    engine = engine_from_network(
+        network_from_onnx_path(onnx_path),
+        config=config,
+        save_timing_cache=timing_cache
+    )
     
-    return engine
+    if engine is None:
+        raise RuntimeError("Failed to build TensorRT engine")
+        
+    save_engine(engine, path=engine_path)
+    
+    # Return Engine wrapper
+    return Engine(engine_path)

@@ -130,7 +130,9 @@ class DiTEngineSimple:
                 "x": x.contiguous(),
                 "timestep": timestep.contiguous(),
                 "context": context.contiguous(),
-                "grid_sizes": grid_sizes.contiguous(),
+                "timestep": timestep.contiguous(),
+                "context": context.contiguous(),
+                "grid_sizes": grid_sizes.contiguous().cpu(), # Force to CPU for Shape Tensor usage
             },
             self._stream,
             use_cuda_graph=self.use_cuda_graph,
@@ -191,59 +193,74 @@ class DiTEngineStreaming:
         self._loaded = True
         logger.info(f"Loaded DiT Streaming engine: {self.engine_path}")
     
-    def _shape_hash(self, x: torch.Tensor, kv_cache: torch.Tensor) -> int:
-        return hash((x.shape, x.dtype, kv_cache.shape))
+    def _shape_hash(self, x: torch.Tensor, kv_caches: tuple) -> int:
+        # Tuple of 5 tensor shapes + x
+        return hash((x.shape, x.dtype, tuple(k.shape for k in kv_caches)))
     
     def __call__(
         self,
         x: torch.Tensor,
         timestep: torch.Tensor,
         context: torch.Tensor,
-        grid_sizes: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_caches: list, # List of 5 tensors
         current_start: torch.Tensor,
-        current_end: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, list]:
         """
-        Run Streaming DiT inference.
+        Run Streaming DiT inference with split caches.
         
+        Args:
+            kv_caches: List of 5 tensors [LayerGroup, 2, B, Seq, H, D]
         Returns:
             output: Denoised latents
-            new_kv_cache: Updated KV cache tensor
+            new_kv_caches: Updated KV cache tensors (same list, in-place update)
         """
         self._ensure_loaded()
         
-        shape_hash = self._shape_hash(x, kv_cache)
+        shape_hash = self._shape_hash(x, kv_caches)
         if shape_hash != self._last_shape_hash:
             shape_dict = {
                 "x": x.shape,
                 "timestep": timestep.shape,
                 "context": context.shape,
-                "grid_sizes": grid_sizes.shape,
-                "kv_cache": kv_cache.shape,
                 "current_start": current_start.shape,
-                "current_end": current_end.shape,
             }
-            self._engine.allocate_buffers(shape_dict, self.device)
+            # Add cache shapes
+            for i, c in enumerate(kv_caches):
+                shape_dict[f"kv_cache_{i}"] = c.shape
+
+            # Skip allocation for KV caches (external)
+            ext_tensors = []
+            for i in range(len(kv_caches)):
+                 ext_tensors.append(f"kv_cache_{i}")
+                 ext_tensors.append(f"new_kv_cache_{i}")
+            
+            self._engine.allocate_buffers(
+                shape_dict, 
+                self.device,
+                external_tensors=ext_tensors
+            )
             if self.use_cuda_graph:
                 self._engine.reset_cuda_graph()
             self._last_shape_hash = shape_hash
         
+        # Build inference dict
+        feed_dict = {
+            "x": x.contiguous(),
+            "timestep": timestep.contiguous(),
+            "context": context.contiguous(),
+            "current_start": current_start.contiguous(),
+        }
+        for i, c in enumerate(kv_caches):
+             feed_dict[f"kv_cache_{i}"] = c # Zero copy
+             feed_dict[f"new_kv_cache_{i}"] = c # In-place
+        
         outputs = self._engine.infer(
-            {
-                "x": x.contiguous(),
-                "timestep": timestep.contiguous(),
-                "context": context.contiguous(),
-                "grid_sizes": grid_sizes.contiguous(),
-                "kv_cache": kv_cache.contiguous(),
-                "current_start": current_start.contiguous(),
-                "current_end": current_end.contiguous(),
-            },
+            feed_dict,
             self._stream,
             use_cuda_graph=self.use_cuda_graph,
         )
         
-        return outputs["output"], outputs["new_kv_cache"]
+        return outputs["output"], kv_caches
 
 
 class VAEEngineSimple:
