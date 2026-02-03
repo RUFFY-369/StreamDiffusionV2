@@ -83,6 +83,7 @@ class TRTAcceleratedInferencePipeline:
         self.config = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.enable_cfg = enable_cfg
+        self.max_seq_len = max_seq_len  # Initialize early for both TRT and PyTorch modes
         
         # Load PyTorch pipeline for VAE and text encoder
         from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
@@ -91,8 +92,13 @@ class TRTAcceleratedInferencePipeline:
         
         # Load TensorRT DiT engine
         from causvid.acceleration.tensorrt.engines.simple_engines import DiTEngineSimple, DiTEngineStreaming
+        import os
         
-        self.streaming = True # Force streaming mode based on user request
+        # Check if TRT engine exists, otherwise fall back to PyTorch
+        self.streaming = os.path.exists(dit_engine_path) if dit_engine_path else False
+        
+        if not self.streaming:
+            logger.info("TRT engine not found or not specified, using pure PyTorch mode")
         
         if self.streaming:
             # FREE PYTORCH KV CACHE to save memory (~18GB for B=2)
@@ -349,21 +355,30 @@ class TRTAcceleratedInferencePipeline:
             prompt_embeds = prompt_embeds[1:2]
         
         # Calculate frame_seqlen for eviction
-        frame_seqlen = H // 2 * W // 2  # Patched dimensions
+        # frame_seqlen = H // 2 * W // 2  # OLD INCORRECT
+        # Correct: (H/8/2) * (W/8/2) = H/16 * W/16
+        frame_seqlen = (H // 16) * (W // 16) 
         num_new_tokens = frame_seqlen * F  # Tokens for all frames in this batch
         
-        # Prepare current_start tensor
-        current_start_t = torch.tensor([current_start], device=device, dtype=torch.long)
+        # Prepare current_start tensor (Physical Cache Index)
+        # Use local_end if available (from metadata), else use current_start arg mapped to cache size
+        # But wait, current_start arg is Logical.
+        # We need to trust the caller loop for logical start, but use metadata for physical start.
         
-        # Determine batch size from prompts (CFG support)
+        # Create tensors
+        start_frame_idx_t = torch.tensor([current_start // frame_seqlen], device=device, dtype=torch.long)
+        
+        # Determine batch size
         B_text = prompt_embeds.shape[0]
         
-        # Check eviction and call TRT engine
         if B_text > 1:
             # CFG mode: process each batch separately
             flow_preds = []
             for b_idx in range(B_text):
-                # Check eviction for this batch
+                # Prepare inputs
+                prompt_slice = prompt_embeds[b_idx:b_idx+1]
+                
+                # Check eviction
                 current_end_for_batch = current_start + num_new_tokens
                 local_end = self.cache_metadata['local_end_index'][b_idx].item()
                 global_end = self.cache_metadata['global_end_index'][b_idx].item()
@@ -375,18 +390,19 @@ class TRTAcceleratedInferencePipeline:
                     new_local_end = self._evict_kv_cache(b_idx, num_new_tokens, frame_seqlen)
                     local_end = new_local_end
                 
-                # Slice inputs for this batch
-                img_slice = noisy_image[:, -F:, ...]  # Use all F frames
-                prompt_slice = prompt_embeds[b_idx:b_idx+1]
                 cache_chunks = self.trt_kv_cache[b_idx]
-                
+                 
+                # Physical Start for Cache Write
+                current_start_physical_t = torch.tensor([local_end], device=device, dtype=torch.long)
+                 
                 # Call TRT engine
                 flow_out, _ = self.dit_engine(
                     img_slice, 
                     torch.full((1, F), current_step if current_step is not None else 0, device=device, dtype=torch.long),
                     prompt_slice,
                     cache_chunks,
-                    current_start_t
+                    current_start_physical_t, # Physical (where to write)
+                    start_frame_idx_t,        # Logical (what time is it)
                 )
                 flow_preds.append(flow_out)
                 
@@ -415,12 +431,17 @@ class TRTAcceleratedInferencePipeline:
             
             # Call TRT engine
             cache_chunks = self.trt_kv_cache[0]
+            
+            # Physical Start for Cache Write based on local_end
+            current_start_physical_t = torch.tensor([local_end], device=device, dtype=torch.long)
+            
             output, _ = self.dit_engine(
                 noisy_image,
                 torch.full((B, F), current_step if current_step is not None else 0, device=device, dtype=torch.long),
                 prompt_embeds,
                 cache_chunks,
-                current_start_t
+                current_start_physical_t, # Physical
+                start_frame_idx_t,        # Logical
             )
             
             # Update metadata
@@ -430,8 +451,95 @@ class TRTAcceleratedInferencePipeline:
                 self.cache_metadata['local_end_index'][b_idx] = new_local
         
         # Return output (no scheduler step, PyTorch's inference_stream returns prediction directly)
+        # TRT output is [B, C, T, H, W], but pipeline expects [B, T, C, H, W]
+        if len(output.shape) == 5:
+             output = output.permute(0, 2, 1, 3, 4)
         return output.to(torch.bfloat16)
     
+    def _sync_pytorch_kv_to_trt(self):
+        """
+        Copy KV cache data from PyTorch pipeline to TRT cache.
+        CRITICAL: This bridges the 'prepare' phase (PyTorch) and 'stream' phase (TRT).
+        Without this, TRT sees empty sink tokens and generates garbage.
+        """
+        logger.info("Synchronizing KV cache from PyTorch to TRT...")
+        
+        # PyTorch cache: List[Dict['k'/'v': Tensor]]
+        pt_cache = self.pytorch_pipeline.kv_cache1
+        
+        # TRT cache: List[List[Tensor]] (Batch -> Chunks)
+        # Chunk shape: [LayersPerChunk, 2, 1, Seq, H, D]
+        
+        num_blocks = len(pt_cache)
+        # Dynamically determine layers per chunk from the allocated cache
+        layers_per_chunk = self.trt_kv_cache[0][0].shape[0]
+        # Determine valid length to copy (sink size)
+        # sink_end = self.pytorch_pipeline.kv_cache_ends[0].item()
+        
+        # Determine valid length to copy (sink size)
+        # The 'prepare' phase fills the first few frames (sink size is 3 frames)
+        sink_end = self.pytorch_pipeline.kv_cache_ends[0].item()
+        
+        # Robustly calculate frame_seqlen from the known sink size (3 frames)
+        if sink_end > 0:
+             real_frame_seqlen = sink_end // 3
+        else:
+             real_frame_seqlen = (self.pytorch_pipeline.height // 2) * (self.pytorch_pipeline.width // 2)
+             
+        logger.info(f"Sync Debug: Sink End (3 frames)={sink_end}")
+        logger.info(f"Sync Debug: Frame Seq Len (Derived)={real_frame_seqlen}")
+        
+        # FIX 2: The previous log showed zeros at index 4000, even though sink_end=4680.
+        # This is because prepare_pipeline was called with current_end=3120 (2 frames).
+        # So essentially, only Frames 0 and 1 are valid. Frame 2 is empty/partial.
+        # SAFE STRATEGY: Sync ONLY 2 Frames (0-1).
+        
+        safe_frames = 2
+        sync_len = safe_frames * real_frame_seqlen
+        
+        logger.info(f"Syncing up to index: {sync_len} (Strategy: Sync 2 Frames & Rewind)")
+        
+        # Update metadata to reflect we have valid history up to sync_len
+        updated_end = sync_len
+        
+        for b_idx in range(len(self.trt_kv_cache)):
+            for i in range(num_blocks):
+                chunk_idx = i // layers_per_chunk
+                layer_idx = i % layers_per_chunk
+                
+                # Get PyTorch K/V
+                k_pt = pt_cache[i]['k']
+                v_pt = pt_cache[i]['v']
+                
+                # Handle batch dimension
+                if k_pt.shape[0] > 1:
+                     k_pt = k_pt[0]
+                     v_pt = v_pt[0]
+                elif k_pt.dim() == 4 and k_pt.shape[0] == 1:
+                     k_pt = k_pt[0]
+                     v_pt = v_pt[0]
+
+                trt_chunk = self.trt_kv_cache[b_idx][chunk_idx]
+                
+                try:
+                    # K: trt_chunk[layer_idx, 0, 0, :sync_len]
+                    valid_len = min(sync_len, k_pt.shape[0])
+                    
+                    trt_chunk[layer_idx, 0, 0, :valid_len] = k_pt[:valid_len].to(dtype=torch.float16)
+                    trt_chunk[layer_idx, 1, 0, :valid_len] = v_pt[:valid_len].to(dtype=torch.float16)
+                         
+                except Exception as e:
+                    logger.error(f"Failed to sync layer {i} (Shape {k_pt.shape} -> {trt_chunk.shape}): {e}")
+                    raise e
+        
+        # Update metadata
+        for b_idx in range(len(self.trt_kv_cache)):
+            self.cache_metadata['local_end_index'][b_idx] = updated_end
+            self.cache_metadata['global_end_index'][b_idx] = updated_end
+            
+        logger.info(f"Successfully synchronized {num_blocks} layers (up to {updated_end}) and updated metadata.")
+        return updated_end
+
     def run_inference_v2v(
         self,
         input_video: torch.Tensor,
@@ -458,6 +566,7 @@ class TRTAcceleratedInferencePipeline:
         start_idx = 0
         end_idx = 5
         current_start = 0
+        # Initialize current_end for prepare. This limits how much PyTorch caches.
         current_end = self.pytorch_pipeline.frame_seq_length * 2
         
         torch.cuda.synchronize()
@@ -486,10 +595,36 @@ class TRTAcceleratedInferencePipeline:
             current_end=current_end,
         )
         
+        # Sync KV cache from PyTorch to TRT
+        # if self.streaming:
+             # synced_end = self._sync_pytorch_kv_to_trt()
+        
+        # FIX: Memory copying from PyTorch is unreliable due to opaque cache management.
+        # ULTIMATE SAFE STRATEGY: Do NOT sync memory.
+        # Instead, start TRT from Frame 0 (rewind completely).
+        # TRT will re-compute Frames 0-5 itself, building its own perfect cache.
+        # We perform a "warm start" by letting PyTorch initialize the pipeline, 
+        # but then we let TRT take over from the beginning.
+        
+        if self.streaming:
+             logger.info("Strategy: Partial Sync failed. Rewinding to Frame 0 for clean TRT start.")
+             
+             # Rewind to Frame 0
+             current_end = 0
+             end_idx = 0
+             
+             # Reset Metadata (just to be safe, though it should be 0 already)
+             for b_idx in range(len(self.trt_kv_cache)):
+                 self.cache_metadata['local_end_index'][b_idx] = 0
+                 self.cache_metadata['global_end_index'][b_idx] = 0
+             logger.info("TRT Cache reset to 0. Starting clean generation.")
+
+        
         # Decode first result
         video = self.vae.stream_decode_to_pixel(denoised_pred)
         video = (video * 0.5 + 0.5).clamp(0, 1)
         video = video[0].permute(0, 2, 3, 1).contiguous()
+        logger.info(f"[DEBUG] First chunk decoded {video.shape[0]} frames (denoised_pred shape: {denoised_pred.shape})")
         results[save_results] = video.cpu().float().numpy()
         save_results += 1
         
@@ -500,22 +635,36 @@ class TRTAcceleratedInferencePipeline:
             start_idx = end_idx
             end_idx = end_idx + chunk_size
             current_start = current_end
-            current_end = current_end + (chunk_size // 4) * self.pytorch_pipeline.frame_seq_length
+            # FIX: With chunk_size=1, (1//4) was 0, so current_end never updated!
+            # The '4' likely came from legacy code assuming 4 frames per block.
+            # We should just multiply by chunk_size since frame_seq_length is usually per-frame (1560).
+            # But wait, frame_seq_length in PyTorch pipeline is 1560 * num_frames? No, usually per frame.
+            # Verified: frame_seq_length in WanPipeline is (H//16)*(W//16).
+            # So increment should be chunk_size * frame_seq_len.
+            current_end = current_end + chunk_size * self.pytorch_pipeline.frame_seq_length
             
             # Check for cache overflow
-            if current_end >= self.max_seq_len:
-                logger.error(f"Cache Overflow! Current end {current_end} > Max {self.max_seq_len}")
-                logger.error("Stopping generation to prevent crash. Reduce frames or disable CFG.")
-                break
+            # Check for cache overflow
+            # With Ring Buffer, current_end (Logical) can safely exceed max_seq_len.
+            # Eviction logic inside inference_stream_trt handles the physical limit.
+            # if current_end >= self.max_seq_len:
+            #     logger.warning(f"Logical Index {current_end} > Max {self.max_seq_len}. Relying on Ring Buffer.")
+            pass
             
             if input_video is not None and end_idx <= input_video.shape[2]:
                 inp = input_video[:, :, start_idx:end_idx]
                 
                 # Adaptive noise
-                l2_dist = (input_video[:, :, end_idx-chunk_size:end_idx] - 
-                          input_video[:, :, end_idx-chunk_size-1:end_idx-1]) ** 2
-                l2_dist = (torch.sqrt(l2_dist.mean(dim=(0, 1, 3, 4))).max() / 0.2).clamp(0, 1)
-                noise_scale = (init_noise_scale - 0.1 * l2_dist.item()) * 0.9 + noise_scale * 0.1
+                # Safe check for boundary condition (cannot compute L2 dist for first frame if start_idx=0)
+                if end_idx - chunk_size > 0:
+                    l2_dist = (input_video[:, :, end_idx-chunk_size:end_idx] - 
+                               input_video[:, :, end_idx-chunk_size-1:end_idx-1]) ** 2
+                    l2_dist = (torch.sqrt(l2_dist.mean(dim=(0, 1, 3, 4))).max() / 0.2).clamp(0, 1)
+                    noise_scale = (init_noise_scale - 0.1 * l2_dist.item()) * 0.9 + noise_scale * 0.1
+                else:
+                    # For the first chunk (if rewound to 0), keep init_noise_scale
+                    pass
+                
                 current_step = int(1000 * noise_scale) - 100
                 
                 latents = self.vae.stream_encode(inp)
@@ -553,6 +702,8 @@ class TRTAcceleratedInferencePipeline:
                 video = (video * 0.5 + 0.5).clamp(0, 1)
                 video = video[0].permute(0, 2, 3, 1).contiguous()
                 
+                logger.info(f"[DEBUG] Chunk {save_results} decoded {video.shape[0]} frames (denoised_pred shape: {denoised_pred.shape})")
+                
                 results[save_results] = video.cpu().float().numpy()
                 save_results += 1
                 
@@ -565,8 +716,12 @@ class TRTAcceleratedInferencePipeline:
                 start_time = end_time
         
         # Save video
-        # Use only valid results
-        video_list = [results[i] for i in range(save_results)]
+        # Only save num_chunks worth of video (not all processed chunks)
+        # Original streamv2v/inference.py only saves num_chunks
+        logger.info(f"[DEBUG] Total saved chunks: {save_results}, num_chunks: {num_chunks}")
+        for i in range(min(save_results, num_chunks)):
+            logger.info(f"[DEBUG] Chunk {i} has {results[i].shape[0]} frames")
+        video_list = [results[i] for i in range(num_chunks)]
         if not video_list:
             logger.error("No frames generated!")
             return

@@ -32,10 +32,22 @@ def parse_args():
         description="Build TensorRT engines for StreamDiffusionV2"
     )
     parser.add_argument(
+        "--config_path",
+        type=str,
+        default="./configs/wan_causal_dmd_v2v.yaml",
+        help="Configuration YAML file path",
+    )
+    parser.add_argument(
         "--model_path",
         type=str,
         default="./wan_models/Wan2.1-T2V-1.3B",
         help="Path to Wan model directory",
+    )
+    parser.add_argument(
+        "--checkpoint_folder",
+        type=str,
+        default=None,
+        help="Optional path to load fine-tuned weights (e.g., ckpts/wan_causal_dmd_v2v)",
     )
     parser.add_argument(
         "--model_type",
@@ -195,30 +207,60 @@ def main():
         logger.error("TensorRT is not installed. Please install tensorrt package.")
         sys.exit(1)
     
-    # Create mock pipeline args for initialization
-    class MockArgs:
-        def __init__(self):
-            self.model_type = args.model_type
-            self.model_name = "causal_wan"
-            self.generator_name = "causal_wan"
-            self.height = args.height
-            self.width = args.width
-            self.num_kv_cache = 21
-            self.num_sink_tokens = 3
-            self.adapt_sink_threshold = -1
-            self.num_frame_per_block = 1
-            self.denoising_step_list = [999, 749, 499, 249, 0]
-            self.warp_denoising_step = True
+    # Load config file (same as original inference.py)
+    logger.info(f"Loading config from {args.config_path}")
+    from omegaconf import OmegaConf
+    config = OmegaConf.load(args.config_path)
     
-    mock_args = MockArgs()
+    # Override model_type from args
+    config.model_type = args.model_type
+    
+    # Inject height/width from CLI args (as Pipeline expects them in 'args')
+    config.height = args.height
+    config.width = args.width
     
     # Initialize pipeline (for model access)
     logger.info("Loading models...")
     from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
     
     try:
-        pipeline = CausalStreamInferencePipeline(mock_args, device)
+        pipeline = CausalStreamInferencePipeline(config, device)
         logger.info("Models loaded successfully")
+        
+        # Load fine-tuned checkpoint if provided
+        if args.checkpoint_folder:
+            logger.info(f"Loading fine-tuned weights from {args.checkpoint_folder}")
+            import os
+            from safetensors.torch import load_file
+            
+            pt_path = os.path.join(args.checkpoint_folder, "model.pt")
+            sf_path = os.path.join(args.checkpoint_folder, "diffusion_pytorch_model.safetensors")
+            
+            if os.path.exists(pt_path):
+                logger.info(f"Loading checkpoint from {pt_path}")
+                ckpt = torch.load(pt_path, map_location="cpu")
+            elif os.path.exists(sf_path):
+                logger.info(f"Loading checkpoint from {sf_path}")
+                ckpt = load_file(sf_path)
+            else:
+                raise FileNotFoundError(f"No checkpoint found in {args.checkpoint_folder}")
+            
+            # Extract state dict
+            if isinstance(ckpt, dict):
+                if 'generator' in ckpt:
+                    state_dict = ckpt['generator']
+                elif 'generator_ema' in ckpt:
+                    state_dict = ckpt['generator_ema']
+                elif 'state_dict' in ckpt:
+                    state_dict = ckpt['state_dict']
+                else:
+                    state_dict = ckpt
+            else:
+                state_dict = ckpt
+            
+            # Load into pipeline
+            msg = pipeline.generator.load_state_dict(state_dict, strict=False)
+            logger.info(f"Fine-tuned checkpoint loaded. Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
         logger.info("Proceeding with standalone engine building...")
@@ -239,7 +281,6 @@ def main():
     if pipeline is not None:
         engines = {}
         
-        # Handle selective building modes
         # Handle selective building modes
         if args.dit_only:
             # Build only DiT (recommended for production)

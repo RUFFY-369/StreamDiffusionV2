@@ -204,6 +204,7 @@ class DiTEngineStreaming:
         context: torch.Tensor,
         kv_caches: list, # List of 5 tensors
         current_start: torch.Tensor,
+        start_frame_idx: torch.Tensor,
     ) -> Tuple[torch.Tensor, list]:
         """
         Run Streaming DiT inference with split caches.
@@ -223,11 +224,12 @@ class DiTEngineStreaming:
                 "timestep": timestep.shape,
                 "context": context.shape,
                 "current_start": current_start.shape,
+                "start_frame_idx": start_frame_idx.shape,
             }
             # Add cache shapes
             for i, c in enumerate(kv_caches):
                 shape_dict[f"kv_cache_{i}"] = c.shape
-
+            
             # Skip allocation for KV caches (external)
             ext_tensors = []
             for i in range(len(kv_caches)):
@@ -249,6 +251,7 @@ class DiTEngineStreaming:
             "timestep": timestep.contiguous(),
             "context": context.contiguous(),
             "current_start": current_start.contiguous(),
+            "start_frame_idx": start_frame_idx.contiguous(),
         }
         for i, c in enumerate(kv_caches):
              feed_dict[f"kv_cache_{i}"] = c # Zero copy

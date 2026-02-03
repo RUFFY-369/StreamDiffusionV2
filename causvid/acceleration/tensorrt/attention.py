@@ -252,6 +252,7 @@ class TRTCausalSelfAttention(nn.Module):
         cache_seqlens: Optional[torch.Tensor] = None,
         current_start: Optional[torch.Tensor] = None,
         current_end: Optional[torch.Tensor] = None,
+        start_frame: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Forward pass with optional KV cache.
@@ -295,7 +296,9 @@ class TRTCausalSelfAttention(nn.Module):
             frame_seqlen = grid_i[1] * grid_i[2]
             
             # Symbolic division
-            start_frame = current_start // frame_seqlen
+            if start_frame is None and current_start is not None:
+                start_frame = current_start // frame_seqlen
+                
             q = trt_causal_rope_apply(q, grid_sizes, freqs, start_frame)
             k = trt_causal_rope_apply(k, grid_sizes, freqs, start_frame)
         
@@ -366,21 +369,53 @@ class TRTCausalSelfAttention(nn.Module):
         v_full = v_full.transpose(1, 2)
         
         # Compute attention using SDPA (ONNX compatible)
-        if causal_mask is not None:
-            # Expand mask for batch and heads
+        # Compute attention using SDPA (ONNX compatible)
+        # Dynamic Masking for Ring Buffer / Infinite Streaming
+        # We cannot rely on the static 'causal_mask' input because:
+        # 1. In Linear phase (Log >> 0), slicing mask[:s] uses rows 0..s instead of Log..Log+s
+        # 2. In Ring phase, Physical ordering != Logical ordering
+        
+        # Strategy: 
+        # - Default: Attend to everything (History is valid)
+        # - Constraint: Within the current chunk (Physical: current_start...current_start+s), enforces causality.
+        
+        attn_mask = None
+        if s > 1 and kv_cache_k is not None and current_start is not None:
+            # Construct dynamic mask
+            # Shape: [B, 1, s, Total_K] -> Broadcast over heads
+            total_k = k_full.shape[2]
+            
+            # Start with all True (Attend to everything)
+            # Use float mask for TRT compatibility often? boolean is fine for SDPA.
+            # We use float -inf for masked, 0 for allowed if additive?
+            # SDPA supports boolean: True = attend, False = mask.
+            
+            # Create base mask: all valid
+            mask = torch.ones((1, 1, s, total_k), device=q.device, dtype=torch.bool)
+            
+            # Apply Causal constraint to the current writing block
+            # We assume batch 0 start implies all batches aligned for mask purposes (ok for streaming)
+            c_start = current_start[0].item() if current_start.numel() > 0 else 0
+            c_end = c_start + s
+            
+            if c_end <= total_k:
+                # Standard contiguous block
+                # Create local causal mask (Lower Triangular = True)
+                local_causal = torch.tril(torch.ones((s, s), device=q.device, dtype=torch.bool))
+                # Apply to the corresponding columns
+                mask[:, :, :, c_start:c_end] = local_causal.view(1, 1, s, s)
+            
+            attn_mask = mask
+        elif causal_mask is not None:
+            # Fallback for non-streaming / static cases
             attn_mask = causal_mask[:s, :k_full.shape[2]]
-            out = F.scaled_dot_product_attention(
-                q, k_full, v_full,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                is_causal=False  # We provide explicit mask
-            )
-        else:
-            out = F.scaled_dot_product_attention(
-                q, k_full, v_full,
-                dropout_p=0.0,
-                is_causal=(kv_cache_k is None)  # Causal only for non-cached
-            )
+
+        out = F.scaled_dot_product_attention(
+            q, k_full, v_full,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False
+        )
         
         # Reshape back: [B, L, C]
         # Reshape back: [B, L, C]

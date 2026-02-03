@@ -165,6 +165,7 @@ class TRTWanAttentionBlock(nn.Module):
         cache_seqlens: Optional[torch.Tensor] = None,
         current_start: Optional[torch.Tensor] = None,
         current_end: Optional[torch.Tensor] = None,
+        start_frame: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward with explicit KV cache I/O.
@@ -184,7 +185,8 @@ class TRTWanAttentionBlock(nn.Module):
         
         y, new_kv_k, new_kv_v = self.self_attn(
             x_modulated, seq_lens, grid_sizes, freqs, causal_mask,
-            kv_cache_k, kv_cache_v, cache_seqlens, current_start, current_end
+            kv_cache_k, kv_cache_v, cache_seqlens, current_start, current_end,
+            start_frame=start_frame
         )
         
         x = x + (y.unflatten(1, (num_frames, frame_seqlen)) * e_mod[2]).flatten(1, 2)
@@ -578,9 +580,10 @@ class CausalWanModelTRTExport(nn.Module):
         kv_cache_25: torch.Tensor,
         kv_cache_26: torch.Tensor,
         kv_cache_27: torch.Tensor,
-        kv_cache_28: torch.Tensor,
-        kv_cache_29: torch.Tensor,
-        current_start: torch.Tensor,
+        kv_cache_28: Optional[torch.Tensor] = None,
+        kv_cache_29: Optional[torch.Tensor] = None,
+        current_start: Optional[torch.Tensor] = None,
+        start_frame_idx: Optional[torch.Tensor] = None, # NEW input for RoPE
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Streaming forward pass (DiT only) - Optimized Interface with SPLIT KV Cache.
@@ -590,7 +593,8 @@ class CausalWanModelTRTExport(nn.Module):
             timestep: [B]
             context: [B, text_len, text_dim]
             kv_cache_0..29: [1, 2, B, MaxSeq, H, D] - 30 chunks of 1 layer each
-            current_start: [B] Start token index for cache update (0-d or 1-d)
+            current_start: [B] Start token index for cache update (Physical memory index)
+            start_frame_idx: [B] Start frame index for RoPE (Logical time index)
         """
         device = x.device
         b = x.shape[0]
@@ -648,7 +652,8 @@ class CausalWanModelTRTExport(nn.Module):
                 kv_cache_k=k_cache, kv_cache_v=v_cache,
                 cache_seqlens=current_start, # Uses start as current length marker
                 current_start=current_start,
-                current_end=None # Calculated internally
+                current_end=None, # Calculated internally
+                start_frame=start_frame_idx, # Pass explicit frame index for RoPE
             )
             
             # Stack updated K/V for this layer

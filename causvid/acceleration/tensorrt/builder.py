@@ -253,8 +253,8 @@ class EngineBuilder:
             def __init__(self, model):
                 super().__init__()
                 self.model = model
-            def forward(self, x, t, c, kv0, kv1, kv2, kv3, kv4, kv5, kv6, kv7, kv8, kv9, kv10, kv11, kv12, kv13, kv14, kv15, kv16, kv17, kv18, kv19, kv20, kv21, kv22, kv23, kv24, kv25, kv26, kv27, kv28, kv29, cs):
-                return self.model.forward_export_streaming(x, t, c, kv0, kv1, kv2, kv3, kv4, kv5, kv6, kv7, kv8, kv9, kv10, kv11, kv12, kv13, kv14, kv15, kv16, kv17, kv18, kv19, kv20, kv21, kv22, kv23, kv24, kv25, kv26, kv27, kv28, kv29, cs)
+            def forward(self, x, t, c, kv0, kv1, kv2, kv3, kv4, kv5, kv6, kv7, kv8, kv9, kv10, kv11, kv12, kv13, kv14, kv15, kv16, kv17, kv18, kv19, kv20, kv21, kv22, kv23, kv24, kv25, kv26, kv27, kv28, kv29, cs, sf):
+                return self.model.forward_export_streaming(x, t, c, kv0, kv1, kv2, kv3, kv4, kv5, kv6, kv7, kv8, kv9, kv10, kv11, kv12, kv13, kv14, kv15, kv16, kv17, kv18, kv19, kv20, kv21, kv22, kv23, kv24, kv25, kv26, kv27, kv28, kv29, cs, sf)
 
         export_model = DiTStreamingWrapper(trt_model).eval()
         
@@ -305,7 +305,8 @@ class EngineBuilder:
             "kv_cache_27": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
             "kv_cache_28": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
             "kv_cache_29": torch.randn(chunk_layers, 2, batch_size, export_seq_len, num_heads, head_dim, device=self.device, dtype=dtype),
-            "current_start": torch.zeros(batch_size, device=self.device, dtype=torch.long),
+            "current_start": torch.tensor([1], device=self.device, dtype=torch.long),
+            "start_frame_idx": torch.tensor([0], device=self.device, dtype=torch.long),
         }
         
         input_names = [
@@ -316,7 +317,7 @@ class EngineBuilder:
             "kv_cache_15", "kv_cache_16", "kv_cache_17", "kv_cache_18", "kv_cache_19",
             "kv_cache_20", "kv_cache_21", "kv_cache_22", "kv_cache_23", "kv_cache_24",
             "kv_cache_25", "kv_cache_26", "kv_cache_27", "kv_cache_28", "kv_cache_29",
-            "current_start"
+            "current_start", "start_frame_idx"
         ]
         output_names = [
             "output", 
@@ -450,6 +451,7 @@ class EngineBuilder:
             "kv_cache_28": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
             "kv_cache_29": ((chunk_layers, 2, 1, 1, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim), (chunk_layers, 2, batch_size, max_seq_len, num_heads, head_dim)),
             "current_start": ((1,), (batch_size,), (batch_size,)),
+            "start_frame_idx": ((1,), (batch_size,), (batch_size,)),
         }
         
         engine = build_engine(
