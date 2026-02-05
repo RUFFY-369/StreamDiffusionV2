@@ -237,7 +237,7 @@ class EngineBuilder:
         
         # We need the model structure
         original_model = pipeline.generator.model
-        trt_model = CausalWanModelTRTExport.from_pretrained_model(original_model)
+        trt_model = CausalWanModelTRTExport.from_pretrained_model(original_model, max_seq_len=max_seq_len)
         
         # Clean up original model
         del original_model

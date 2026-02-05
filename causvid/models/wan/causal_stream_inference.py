@@ -250,6 +250,20 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         if current_step is not None:
             self.timestep[0] = current_step
         
+        # DEBUG PRINTS FOR COMPARISON
+        print(f"[PYTORCH DEBUG] inference_stream call:")
+        print(f"  x: {self.hidden_states.shape} dtype={self.hidden_states.dtype} mean={self.hidden_states.float().mean().item():.4f} std={self.hidden_states.float().std().item():.4f}")
+        print(f"  timestep: {self.timestep.unsqueeze(1).expand(-1, self.hidden_states.shape[1]).shape} vals={self.timestep}")
+        print(f"  current_start: {self.kv_cache_starts} shape={self.kv_cache_starts.shape}")
+        print(f"  current_end: {self.kv_cache_ends} shape={self.kv_cache_ends.shape}")
+        if 'prompt_embeds' in self.conditional_dict:
+            ctx = self.conditional_dict['prompt_embeds']
+            print(f"  context: {ctx.shape} mean={ctx.float().mean().item():.4f} std={ctx.float().std().item():.4f}")
+        
+        if self.kv_cache1:
+             print(f"  kv_cache[0]['k']: {self.kv_cache1[0]['k'].shape}")
+             print(f"  kv_cache[0]['global_end']: {self.kv_cache1[0]['global_end_index']}")
+
         self.hidden_states = self.generator(
             noisy_image_or_video=self.hidden_states,
             conditional_dict=self.conditional_dict,
@@ -259,6 +273,7 @@ class CausalStreamInferencePipeline(torch.nn.Module):
             current_start=self.kv_cache_starts,
             current_end=self.kv_cache_ends,
         )
+        print(f"  [PYTORCH DEBUG] DiT Output (hidden_states): shape={self.hidden_states.shape} mean={self.hidden_states.mean().item():.4f} std={self.hidden_states.std().item():.4f}")
 
         for i in range(len(self.denoising_step_list) - 1):
             self.hidden_states[[i]] = self.scheduler.add_noise(

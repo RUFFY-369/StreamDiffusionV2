@@ -117,18 +117,25 @@ def trt_rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tenso
         freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)  # [seq, 1, half_d]
         
         # Real-number rotary embedding (avoid complex numbers for ONNX)
-        # Split x into two halves for rotation
-        x_1, x_2 = x_i[..., :half_d], x_i[..., half_d:]  # [seq, n, half_d] each
+        # CORRECTION: WanModel uses adjacent pairs (view_as_complex on last dim)
+        # So Real = x[0::2], Imag = x[1::2]
+        x_real = x_i[..., 0::2]
+        x_imag = x_i[..., 1::2]
         
-        # Get cos and sin of frequencies
-        cos_freqs = freqs_i.cos().expand(-1, n, -1)  # [seq, n, half_d]
-        sin_freqs = freqs_i.sin().expand(-1, n, -1)  # [seq, n, half_d]
+        # freqs_i is [seq, 1, half_d] -> expand to [seq, n, half_d]
+        cos_freqs = freqs_i.cos().expand(-1, n, -1)
+        sin_freqs = freqs_i.sin().expand(-1, n, -1)
         
-        # Apply rotation: [x1, x2] -> [x1*cos - x2*sin, x1*sin + x2*cos]
-        x_rotated_1 = x_1 * cos_freqs - x_2 * sin_freqs
-        x_rotated_2 = x_1 * sin_freqs + x_2 * cos_freqs
+        # Rotate
+        # (a + ib) * (cos + isin) = (acos - bsin) + i(asin + bcos)
+        out_real = x_real * cos_freqs - x_imag * sin_freqs
+        out_imag = x_real * sin_freqs + x_imag * cos_freqs
         
-        x_rotated = torch.cat([x_rotated_1, x_rotated_2], dim=-1)  # [seq, n, d]
+        # Interleave back: stack on last dim then flatten
+        # Stack: [seq, n, half_d, 2] -> Flatten: [seq, n, d]
+        # Use simple operations to avoid TRT shape overflow
+        x_rotated = torch.cat([out_real.unsqueeze(-1), out_imag.unsqueeze(-1)], dim=-1)
+        x_rotated = x_rotated.reshape(x_rotated.shape[:-2] + (d,))
         
         # Handle padding
         if actual_seq_len < seq_len:
@@ -181,21 +188,32 @@ def trt_causal_rope_apply(
         x_i = x[i, :actual_seq_len].float()  # [seq, n, d]
         
         # Build frequency tensor with offset
-        freqs_f = freqs_split[0][sf:sf + f].view(f, 1, 1, -1).expand(f, h, w, -1)
+        # Use explicit dynamic indexing to prevent constant folding of 'sf'
+        idx_f = torch.arange(f, device=x.device) + sf
+        # freq_max must be a python int or tensor on same device
+        freq_max = int(freqs_split[0].shape[0]) - 1
+        idx_f = idx_f.long().clamp(max=freq_max) 
+        
+        freqs_f = freqs_split[0][idx_f].view(f, 1, 1, -1).expand(f, h, w, -1)
         freqs_h = freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
         freqs_w = freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         freqs_i = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(actual_seq_len, 1, -1)  # [seq, 1, half_d]
         
         # Real-number rotary embedding (avoid complex numbers for ONNX)
-        x_1, x_2 = x_i[..., :half_d], x_i[..., half_d:]  # [seq, n, half_d] each
+        # CORRECTION: WanModel uses adjacent pairs (view_as_complex on last dim)
+        x_real = x_i[..., 0::2]
+        x_imag = x_i[..., 1::2]
         
         cos_freqs = freqs_i.cos().expand(-1, n, -1)
         sin_freqs = freqs_i.sin().expand(-1, n, -1)
         
-        x_rotated_1 = x_1 * cos_freqs - x_2 * sin_freqs
-        x_rotated_2 = x_1 * sin_freqs + x_2 * cos_freqs
+        # Rotate
+        out_real = x_real * cos_freqs - x_imag * sin_freqs
+        out_imag = x_real * sin_freqs + x_imag * cos_freqs
         
-        x_rotated = torch.cat([x_rotated_1, x_rotated_2], dim=-1)  # [seq, n, d]
+        # Interleave back
+        x_rotated = torch.cat([out_real.unsqueeze(-1), out_imag.unsqueeze(-1)], dim=-1)
+        x_rotated = x_rotated.reshape(x_rotated.shape[:-2] + (d,))
         
         if actual_seq_len < seq_len:
             x_rotated = torch.cat([x_rotated, x[i, actual_seq_len:].float()], dim=0)
@@ -390,20 +408,67 @@ class TRTCausalSelfAttention(nn.Module):
             # We use float -inf for masked, 0 for allowed if additive?
             # SDPA supports boolean: True = attend, False = mask.
             
-            # Create base mask: all valid
-            mask = torch.ones((1, 1, s, total_k), device=q.device, dtype=torch.bool)
-            
             # Apply Causal constraint to the current writing block
-            # We assume batch 0 start implies all batches aligned for mask purposes (ok for streaming)
-            c_start = current_start[0].item() if current_start.numel() > 0 else 0
+            # USE TENSOR INDEXING to prevent constant folding
+            c_start = current_start[0] # Tensor scalar-like
             c_end = c_start + s
             
-            if c_end <= total_k:
-                # Standard contiguous block
-                # Create local causal mask (Lower Triangular = True)
-                local_causal = torch.tril(torch.ones((s, s), device=q.device, dtype=torch.bool))
-                # Apply to the corresponding columns
-                mask[:, :, :, c_start:c_end] = local_causal.view(1, 1, s, s)
+            # We must use tensor-based masking
+            # Create indices [0...Total_K]
+            col_indices = torch.arange(total_k, device=q.device).view(1, 1, 1, total_k)
+            
+            # 1. Intra-chunk causality: mask [c_start : c_end] with tril
+            # This is hard to do with pure vector logic without scattering.
+            # But the local_causal pattern is static shape (s, s).
+            # We can use previous logic IF slice assignment supports tensor indices?
+            # Assigning to mask[:, :, :, c_start:c_end] works if c_start is int.
+            # If c_start is tensor, we need:
+            # mask.index_put_((slice(None), slice(None), slice(None), range_tensor), local_causal)
+            # Range tensor:
+            range_tensor = torch.arange(s, device=q.device) + c_start
+            
+            # Clamp range to be safe (though it should fit)
+            max_val = torch.tensor(total_k - 1, device=q.device, dtype=torch.long)
+            range_tensor = range_tensor.clamp(max=max_val)
+            
+            # Create expansion of local_causal to match mask dims?
+            # We need to scatter the local_causal into the big mask.
+            # TRT doesn't love scatter.
+            # Alternative: Construct mask analytically.
+            # A position (i, j) in (s, total_k) is ALLOWED if:
+            #   (j < c_start) OR (j >= c_start AND j < c_end AND j <= (c_start + i))
+            #   AND j < valid_end
+            
+            # Row indices [0...s]
+            row_indices = torch.arange(s, device=q.device).view(1, 1, s, 1)
+            
+            # Condition 1: History (j < c_start) -> True
+            cond_history = col_indices < c_start.view(1, 1, 1, 1)
+            
+            # Condition 2: Intra-chunk (c_start <= j < c_end AND j <= c_start + i)
+            # j relative to chunk start: j_rel = j - c_start
+            cond_intra_range = (col_indices >= c_start.view(1, 1, 1, 1)) & (col_indices < c_end.view(1, 1, 1, 1))
+            cond_causal = col_indices <= (c_start.view(1, 1, 1, 1) + row_indices)
+            cond_intra = cond_intra_range & cond_causal
+            
+            # Initial Allowed Mask (History + Intra-Causal)
+            mask = cond_history | cond_intra
+            
+            # Condition 3: Valid Memory (Optimization for Zeros)
+            # Check for valid usage of Ring Buffer
+            f_g, h_g, w_g = torch.unbind(grid_sizes[0], dim=0)
+            frame_len = f_g * h_g * w_g
+            
+            sf_val = start_frame[0] # Tensor
+            logical_valid = (sf_val * frame_len) + s # Tensor
+            
+            # valid_end = min(logical_valid, total_k)
+            valid_end = torch.min(logical_valid, torch.tensor(total_k, device=q.device))
+            
+            cond_valid = col_indices < valid_end.view(1, 1, 1, 1)
+            
+            # Final Mask = (History OR Intra) AND Valid_Memory
+            mask = mask & cond_valid
             
             attn_mask = mask
         elif causal_mask is not None:

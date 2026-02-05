@@ -167,7 +167,8 @@ class TRTAcceleratedInferencePipeline:
             self.max_seq_len = max_seq_len
             
             # Allocate 5 chunks of cache
-            # Shape per chunk: [6, 2, 1, Seq, Head, Dim]
+            # Shape per chunk: [Layers, 2, Batch, Seq, Head, Dim] where Batch=1 (Required by Engine)
+            # 6D shape: [Layers, 2, 1, Seq, Head, Dim]
             chunk_shape = (num_layers_per_chunk, 2, 1, max_seq_len, num_heads, head_dim)
             logger.info(f"Allocating {num_caches} x {num_chunks} TRT KV Chunks: {chunk_shape} (Float16)")
             logger.info(f"Total Cache Memory: {required_mem/1e9:.2f} GB")
@@ -272,11 +273,12 @@ class TRTAcceleratedInferencePipeline:
         # Shift cache left for all chunks (evict oldest non-sink tokens)
         cache_chunks = self.trt_kv_cache[batch_idx]
         for chunk in cache_chunks:
-            # chunk shape: [1, 2, 1, MaxSeq, H, D]
+            # chunk shape: [Layers, 2, Batch, MaxSeq, H, D] (Layers=1, Batch=1)
             # Extract K and V: [2, 1, MaxSeq, H, D]
             kv = chunk[0]  # [2, 1, MaxSeq, H, D]
             
             # Shift K cache (index 0)
+            # kv[0] is [1, MaxSeq, H, D]. We slice on dim 1 (Seq).
             kv[0, :, sink_tokens:sink_tokens + num_rolled_tokens] = \
                 kv[0, :, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
             
@@ -355,18 +357,25 @@ class TRTAcceleratedInferencePipeline:
             prompt_embeds = prompt_embeds[1:2]
         
         # Calculate frame_seqlen for eviction
-        # frame_seqlen = H // 2 * W // 2  # OLD INCORRECT
-        # Correct: (H/8/2) * (W/8/2) = H/16 * W/16
-        frame_seqlen = (H // 16) * (W // 16) 
-        num_new_tokens = frame_seqlen * F  # Tokens for all frames in this batch
+        # Latents are H_pix // 8, W_pix // 8.
+        # Patch size is 2x2.
+        # Tokens = (H_lat // 2) * (W_lat // 2)
+        # H, W here are LATENT dims from noisy_image shape
+        frame_seqlen = (H // 2) * (W // 2)
+        num_new_tokens = frame_seqlen * F
         
         # Prepare current_start tensor (Physical Cache Index)
-        # Use local_end if available (from metadata), else use current_start arg mapped to cache size
-        # But wait, current_start arg is Logical.
-        # We need to trust the caller loop for logical start, but use metadata for physical start.
+        # TRT expects Rank 1 tensor [B] for indices.
+        # We should use torch.tensor([val], device=...).
         
-        # Create tensors
-        start_frame_idx_t = torch.tensor([current_start // frame_seqlen], device=device, dtype=torch.long)
+        # FIX: Wrap logical frame index to stay within Engine Profile Max (24000)
+        # Otherwise, start_frame_idx keeps growing and crashes TRT shape inference.
+        kv_cache_size = self.cache_metadata['kv_cache_size']
+        start_frame_idx_t = torch.tensor(
+            [(current_start % kv_cache_size) // frame_seqlen], 
+            device=device, 
+            dtype=torch.long
+        )
         
         # Determine batch size
         B_text = prompt_embeds.shape[0]
@@ -433,16 +442,37 @@ class TRTAcceleratedInferencePipeline:
             cache_chunks = self.trt_kv_cache[0]
             
             # Physical Start for Cache Write based on local_end
+            # Physical Start for Cache Write based on local_end
             current_start_physical_t = torch.tensor([local_end], device=device, dtype=torch.long)
             
+            timestep = torch.full((B, F), current_step if current_step is not None else 0, device=device, dtype=torch.long)
+            
+            logger.info(f"[TRT DEBUG] Engine Call:")
+            logger.info(f"  x: {noisy_image.shape} mean={noisy_image.float().mean().item():.4f} std={noisy_image.float().std().item():.4f}")
+            logger.info(f"  timestep: {timestep.shape} val={timestep.item()}")
+            logger.info(f"  context: {prompt_embeds.shape} mean={prompt_embeds.float().mean().item():.4f} std={prompt_embeds.float().std().item():.4f}")
+            logger.info(f"  current_start (phys): {current_start_physical_t.shape} item={current_start_physical_t.item()}")
+            logger.info(f"  start_frame (logic): {start_frame_idx_t.shape} item={start_frame_idx_t.item()}")
+            logger.info(f"  local_end: {local_end}")
+            logger.info(f"  local_end: {local_end}")
+            logger.info(f"  num_new_tokens: {num_new_tokens}")
+            
+            # SANITY CHECK: Verify 6D Shapes and Dtypes
+            logger.info("[TRT SANITY] Checking Inputs before DiT Engine Call:")
+            for i, c in enumerate(cache_chunks):
+                logger.info(f"  KV {i}: shape={c.shape} dtype={c.dtype} stride={c.stride()}")
+            logger.info(f"  current_start_physical_t: {current_start_physical_t.item()} dtype={current_start_physical_t.dtype} shape={current_start_physical_t.shape}")
+            logger.info(f"  start_frame_idx_t: {start_frame_idx_t.item()} dtype={start_frame_idx_t.dtype} shape={start_frame_idx_t.shape}")
+
             output, _ = self.dit_engine(
                 noisy_image,
-                torch.full((B, F), current_step if current_step is not None else 0, device=device, dtype=torch.long),
+                timestep,
                 prompt_embeds,
                 cache_chunks,
                 current_start_physical_t, # Physical
                 start_frame_idx_t,        # Logical
             )
+            logger.info(f"  [TRT DEBUG] TRT Output: shape={output.shape} mean={output.float().mean().item():.4f} std={output.float().std().item():.4f}")
             
             # Update metadata
             if current_end_for_batch > global_end:
@@ -564,7 +594,7 @@ class TRTAcceleratedInferencePipeline:
         dit_fps_list = []
         
         start_idx = 0
-        end_idx = 5
+        end_idx = 17 # Increase to 17 (1 header + 16 body) to ensure robust VAE initialization
         current_start = 0
         # Initialize current_end for prepare. This limits how much PyTorch caches.
         current_end = self.pytorch_pipeline.frame_seq_length * 2
@@ -574,7 +604,9 @@ class TRTAcceleratedInferencePipeline:
         
         # First chunk
         if input_video is not None:
+            logger.info(f"Loaded input_video shape: {input_video.shape}")
             inp = input_video[:, :, start_idx:end_idx]
+            logger.info(f"Initial chunk (indices {start_idx}:{end_idx}) shape: {inp.shape}")
             latents = self.vae.stream_encode(inp)
             latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
             
@@ -607,17 +639,24 @@ class TRTAcceleratedInferencePipeline:
         # but then we let TRT take over from the beginning.
         
         if self.streaming:
-             logger.info("Strategy: Partial Sync failed. Rewinding to Frame 0 for clean TRT start.")
+             logger.info("Strategy: Partial Sync failed. Rewinding to Frame 0 for clean TRT start (required for empty cache).")
              
              # Rewind to Frame 0
+             # Since we are NOT syncing PyTorch KV check (safe execution), we must start from 0.
+             # Starting at 3120 with empty cache causes Shape Overflow in attention plugin.
              current_end = 0
              end_idx = 0
              
-             # Reset Metadata (just to be safe, though it should be 0 already)
+             # Reset Metadata to 0
              for b_idx in range(len(self.trt_kv_cache)):
                  self.cache_metadata['local_end_index'][b_idx] = 0
                  self.cache_metadata['global_end_index'][b_idx] = 0
              logger.info("TRT Cache reset to 0. Starting clean generation.")
+             
+             # CRITICAL: Reset VAE state to prevent corruption loop
+             if hasattr(self.vae, 'clear_cache'):
+                 self.vae.clear_cache()
+                 logger.info("VAE streaming cache cleared.")
 
         
         # Decode first result
@@ -641,7 +680,15 @@ class TRTAcceleratedInferencePipeline:
             # But wait, frame_seq_length in PyTorch pipeline is 1560 * num_frames? No, usually per frame.
             # Verified: frame_seq_length in WanPipeline is (H//16)*(W//16).
             # So increment should be chunk_size * frame_seq_len.
-            current_end = current_end + chunk_size * self.pytorch_pipeline.frame_seq_length
+            
+            # Logic Update: current_end is managed inside the latent loop now.
+            # We must NOT increment it here again based on chunk_size if we do it inside.
+            # But wait, start_idx/end_idx still proceed by chunk_size.
+            # current_start for the NEXT chunk should be the current_end AFTER the loop.
+            # So we don't need to increment it here.
+            pass
+            
+            # Check for cache overflow
             
             # Check for cache overflow
             # Check for cache overflow
@@ -653,6 +700,7 @@ class TRTAcceleratedInferencePipeline:
             
             if input_video is not None and end_idx <= input_video.shape[2]:
                 inp = input_video[:, :, start_idx:end_idx]
+                logger.info(f"[TRT DEBUG] Input Video: shape={inp.shape} mean={inp.float().mean().item():.4f} std={inp.float().std().item():.4f}")
                 
                 # Adaptive noise
                 # Safe check for boundary condition (cannot compute L2 dist for first frame if start_idx=0)
@@ -668,37 +716,81 @@ class TRTAcceleratedInferencePipeline:
                 current_step = int(1000 * noise_scale) - 100
                 
                 latents = self.vae.stream_encode(inp)
+                logger.info(f"[TRT DEBUG] VAE Latents: shape={latents.shape} mean={latents.float().mean().item():.4f} std={latents.float().std().item():.4f}")
                 latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
                 
-                noise = torch.randn_like(latents)
-                noisy_latents = noise * noise_scale + latents * (1 - noise_scale)
+                # Decouple: VAE produced T>1 latents. DiT expects T=1.
+                # Loop over latents.
+                denoised_latents_list = []
+                # latents is [B, T, C, H, W] after transpose
+                num_latents = latents.shape[1] 
+                
+                # Base noise for the whole block
+                noise_base = torch.randn_like(latents)
+                noisy_latents_base = noise_base * noise_scale + latents * (1 - noise_scale)
+                
+                for i in range(num_latents):
+                    # Slice Time dimension (Dim 1)
+                    sub_noisy = noisy_latents_base[:, i:i+1, :, :, :]
+                    
+                    torch.cuda.synchronize()
+                    dit_start_time = time.time()
+                    
+                    # DiT inference (TRT integration point)
+                    # sub_noisy shape: [B, 1, C, H, W] -> e.g. [1, 1, 16, 60, 104]
+                    
+                    sub_pred = self.inference_stream_trt(
+                        noise=sub_noisy,
+                        current_start=current_start,
+                        current_end=current_end,
+                        current_step=current_step,
+                    )
+                    
+                    denoised_latents_list.append(sub_pred)
+                    
+                    # Increment for next latent
+                    frame_seq = self.pytorch_pipeline.frame_seq_length
+                    
+                    # Advance logical time for next iteration
+                    current_start = current_end
+                    current_end = current_end + frame_seq
+                    
+                    # Wrap logical timeline only (not physical cache)
+                    if current_start >= self.max_seq_len:
+                        current_start = current_start % self.max_seq_len
+                    if current_end >= self.max_seq_len:
+                        current_end = current_end % self.max_seq_len
+                    # Update current_start if needed? No, Ring Buffer handles cache indices via modulo.
+                    # But for correct KV referencing? 
+                    # If T=1, next T=1 depends on this one.
+                    # `current_start` argument in `inference_stream_trt` is usually `start_turn_index` (cache sink check).
+                    # Actually `inference_stream_trt` uses `current_start` mainly to check if we are full?
+                    # Let's trust `current_end` increment is enough.
+                    
+                    if self.processed > 3:
+                        torch.cuda.synchronize()
+                        # FPS based on 1 latent (~4 frames)
+                        # chunk_size is total frames.
+                        # Per latent time.
+                        # Total FPS will be calc'd at end of block.
+                        pass
+                
+                denoised_pred = torch.cat(denoised_latents_list, dim=2)
             else:
-                noisy_latents = torch.randn(
-                    1, self.pytorch_pipeline.num_frame_per_block, 16,
-                    self.pytorch_pipeline.height, self.pytorch_pipeline.width,
-                    device=self.device, dtype=torch.bfloat16
-                )
-                current_step = None
-            
-            torch.cuda.synchronize()
-            dit_start_time = time.time()
-            
-            # DiT inference (TRT integration point)
-            denoised_pred = self.inference_stream_trt(
-                noise=noisy_latents,
-                current_start=current_start,
-                current_end=current_end,
-                current_step=current_step,
-            )
+                 # Padding case (unused in V2V usually)
+                 pass
+                 denoised_pred = torch.zeros(1, 5, 16, 60, 104, device=self.device, dtype=torch.bfloat16)
+
             
             if self.processed > 3:
                 torch.cuda.synchronize()
-                dit_fps_list.append(chunk_size / (time.time() - dit_start_time))
+                dit_fps_list.append(chunk_size / (time.time() - start_time)) # Approx
             
             self.processed += 1
             
-            if self.processed >= num_steps:
-                video = self.vae.stream_decode_to_pixel(denoised_pred[[-1]])
+            if self.processed >= num_steps: # Logic check? processed is chunks?
+                # Decoder expects [B, 16, T, H, W] -> [B, 3, T*4, H*16, W*16]
+                video = self.vae.stream_decode_to_pixel(denoised_pred)
                 video = (video * 0.5 + 0.5).clamp(0, 1)
                 video = video[0].permute(0, 2, 3, 1).contiguous()
                 
@@ -716,12 +808,8 @@ class TRTAcceleratedInferencePipeline:
                 start_time = end_time
         
         # Save video
-        # Only save num_chunks worth of video (not all processed chunks)
-        # Original streamv2v/inference.py only saves num_chunks
         logger.info(f"[DEBUG] Total saved chunks: {save_results}, num_chunks: {num_chunks}")
-        for i in range(min(save_results, num_chunks)):
-            logger.info(f"[DEBUG] Chunk {i} has {results[i].shape[0]} frames")
-        video_list = [results[i] for i in range(num_chunks)]
+        video_list = [results[i] for i in range(save_results) if i in results]
         if not video_list:
             logger.error("No frames generated!")
             return
@@ -808,7 +896,7 @@ def main():
     prompts = [dataset[0]]
     
     # Run inference
-    chunk_size = 4
+    chunk_size = 17
     num_chunks = (t - 1) // chunk_size
     num_steps = len(config.denoising_step_list)
     

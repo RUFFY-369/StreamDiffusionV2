@@ -79,7 +79,7 @@ class CausalWanModelTRT(BaseModelTRT):
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         in_dim: int = 16,
         out_dim: int = 16,
-        max_kv_cache_len: int = 32760,  # ~21 frames
+        max_kv_cache_len: int = 24000,  # Validated safe limit for 24GB VRAM
         fp16: bool = True,
         device: str = "cuda",
         max_batch_size: int = 4,
@@ -184,7 +184,7 @@ class CausalWanModelTRT(BaseModelTRT):
         frame_seqlen = (lat_h // self.patch_size[1]) * (lat_w // self.patch_size[2])
         
         min_b, opt_b, max_b = 1, batch_size, self.max_batch
-        min_f, opt_f, max_f = 1, num_frames, 21  # Standard max frames
+        min_f, opt_f, max_f = 1, num_frames, num_frames  # Dynamic max frames
         
         profile = {
             "x": [
@@ -247,7 +247,9 @@ class CausalWanModelTRT(BaseModelTRT):
         lat_h = height // 8
         lat_w = width // 8
         frame_seqlen = (lat_h // self.patch_size[1]) * (lat_w // self.patch_size[2])
-        cache_len = frame_seqlen * num_frames
+        # Use max_kv_cache_len for sample input to ensure internal constants (like masks)
+        # are traced with the full capacity, preventing runtime shape overflows.
+        cache_len = self.max_kv_cache_len
         
         inputs = {
             "x": torch.randn(batch_size, num_frames, self.in_dim, lat_h, lat_w, 

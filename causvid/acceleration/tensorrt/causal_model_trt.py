@@ -233,6 +233,7 @@ class CausalWanModelTRTExport(nn.Module):
         qk_norm: bool = True,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
+        max_seq_len: int = 24000,
     ):
         super().__init__()
         
@@ -283,16 +284,16 @@ class CausalWanModelTRTExport(nn.Module):
         # RoPE frequencies (real-valued for ONNX compatibility)
         d = dim // num_heads
         self.register_buffer('freqs', torch.cat([
-            trt_rope_params(1024, d - 4 * (d // 6)),
-            trt_rope_params(1024, 2 * (d // 6)),
-            trt_rope_params(1024, 2 * (d // 6))
+            trt_rope_params(max_seq_len, d - 4 * (d // 6)),
+            trt_rope_params(max_seq_len, 2 * (d // 6)),
+            trt_rope_params(max_seq_len, 2 * (d // 6))
         ], dim=1))
         
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
     
     @classmethod
-    def from_pretrained_model(cls, original_model) -> 'CausalWanModelTRTExport':
+    def from_pretrained_model(cls, original_model, max_seq_len: int = 24000) -> 'CausalWanModelTRTExport':
         """Create TRT-exportable model from pretrained CausalWanModel."""
         # Access attributes directly from model (not from config dict)
         # Handle patch_size which might not be in config but on model instance
@@ -313,7 +314,9 @@ class CausalWanModelTRTExport(nn.Module):
             window_size=original_model.window_size,
             qk_norm=original_model.qk_norm,
             cross_attn_norm=original_model.cross_attn_norm,
+            cross_attn_norm=original_model.cross_attn_norm,
             eps=original_model.eps,
+            max_seq_len=max_seq_len,
         )
         
         # Copy weights from original model
