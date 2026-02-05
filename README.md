@@ -133,6 +133,45 @@ Note: `--step` sets how many denoising steps are used during inference. Enabling
 
 Adjust `--nproc_per_node` to your GPU count. For different resolutions or FPS, change `--height`, `--width`, and `--fps` accordingly.
 
+## TensorRT Inference (DiT acceleration, pipeline-compatible)
+
+For stable acceleration without changing pipeline behavior, build only the streaming DiT engine and keep VAE/Text encoder in PyTorch.
+
+### 1) Build TensorRT engine
+
+```shell
+python scripts/build_tensorrt_engines.py \
+  --config_path configs/wan_causal_dmd_v2v.yaml \
+  --checkpoint_folder ckpts/wan_causal_dmd_v2v \
+  --model_type T2V-1.3B \
+  --output_dir trt_engines \
+  --height 480 \
+  --width 832 \
+  --dit_only \
+  --skip_t5 \
+  --skip_vae \
+  --streaming
+```
+
+### 2) Run accelerated vid2vid inference
+
+```shell
+python scripts/trt_inference.py \
+  --config_path configs/wan_causal_dmd_v2v.yaml \
+  --checkpoint_folder ckpts/wan_causal_dmd_v2v \
+  --output_folder outputs/ \
+  --prompt_file_path prompt.txt \
+  --video_path original.mp4 \
+  --dit_engine_path trt_engines/dit_streaming.engine \
+  --height 480 \
+  --width 832 \
+  --fps 16 \
+  --step 2 \
+  --chunk_size 4
+```
+
+This keeps the original streaming denoising contract (`step`, chunking, and VAE decode flow) while only replacing DiT compute with TensorRT.
+
 ## Online Inference (Web UI)
 A minimal web demo is available under `demo/`. For setup and startup, please refer to [demo](demo/README.md).
 - Access in a browser after startup: `http://0.0.0.0:7860` or `http://localhost:7860`

@@ -594,7 +594,9 @@ class TRTAcceleratedInferencePipeline:
         dit_fps_list = []
         
         start_idx = 0
-        end_idx = 17 # Increase to 17 (1 header + 16 body) to ensure robust VAE initialization
+        # Keep chunk contract aligned with PyTorch baseline inference:
+        # warmup uses 5 frames, then every loop consumes `chunk_size` (default=4).
+        end_idx = 5
         current_start = 0
         # Initialize current_end for prepare. This limits how much PyTorch caches.
         current_end = self.pytorch_pipeline.frame_seq_length * 2
@@ -681,12 +683,7 @@ class TRTAcceleratedInferencePipeline:
             # Verified: frame_seq_length in WanPipeline is (H//16)*(W//16).
             # So increment should be chunk_size * frame_seq_len.
             
-            # Logic Update: current_end is managed inside the latent loop now.
-            # We must NOT increment it here again based on chunk_size if we do it inside.
-            # But wait, start_idx/end_idx still proceed by chunk_size.
-            # current_start for the NEXT chunk should be the current_end AFTER the loop.
-            # So we don't need to increment it here.
-            pass
+            # `current_end` is advanced inside the per-latent loop.
             
             # Check for cache overflow
             
@@ -696,7 +693,6 @@ class TRTAcceleratedInferencePipeline:
             # Eviction logic inside inference_stream_trt handles the physical limit.
             # if current_end >= self.max_seq_len:
             #     logger.warning(f"Logical Index {current_end} > Max {self.max_seq_len}. Relying on Ring Buffer.")
-            pass
             
             if input_video is not None and end_idx <= input_video.shape[2]:
                 inp = input_video[:, :, start_idx:end_idx]
@@ -769,17 +765,12 @@ class TRTAcceleratedInferencePipeline:
                     
                     if self.processed > 3:
                         torch.cuda.synchronize()
-                        # FPS based on 1 latent (~4 frames)
-                        # chunk_size is total frames.
-                        # Per latent time.
-                        # Total FPS will be calc'd at end of block.
-                        pass
                 
-                denoised_pred = torch.cat(denoised_latents_list, dim=2)
+                # Concatenate over temporal axis [B, T, C, H, W]
+                denoised_pred = torch.cat(denoised_latents_list, dim=1)
             else:
                  # Padding case (unused in V2V usually)
-                 pass
-                 denoised_pred = torch.zeros(1, 5, 16, 60, 104, device=self.device, dtype=torch.bfloat16)
+                 denoised_pred = torch.zeros(1, 1, 16, 60, 104, device=self.device, dtype=torch.bfloat16)
 
             
             if self.processed > 3:
@@ -840,6 +831,7 @@ def main():
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type")
+    parser.add_argument("--chunk_size", type=int, default=4, help="Streaming chunk size (must match training/inference assumptions).")
     
     # New args
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="CFG scale. Set to 1.0 to save memory.")
@@ -896,7 +888,7 @@ def main():
     prompts = [dataset[0]]
     
     # Run inference
-    chunk_size = 17
+    chunk_size = args.chunk_size
     num_chunks = (t - 1) // chunk_size
     num_steps = len(config.denoising_step_list)
     
