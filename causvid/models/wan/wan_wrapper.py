@@ -134,6 +134,13 @@ class WanVAEWrapper(VAEInterface):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
+    def clear_cache(self):
+        """Reset internal state for streaming inference."""
+        self.model.first_decode = True
+        self.model.clear_cache_decode()
+        self.model.first_encode = True
+        self.model.clear_cache_encode()
+
 
 class WanDiffusionWrapper(DiffusionModelInterface):
     def __init__(self, model_type="T2V-1.3B"):

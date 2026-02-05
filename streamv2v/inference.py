@@ -208,10 +208,12 @@ class SingleGPUInferencePipeline:
         
         # Process first chunk (initialization)
         if input_video_original is not None:
+            print(f"[PYTORCH DEBUG] Input Video: shape={input_video_original.shape} mean={input_video_original.float().mean().item():.4f} std={input_video_original.float().std().item():.4f}")
             inp = input_video_original[:, :, start_idx:end_idx]
             
             # VAE encoding
             latents = self.pipeline.vae.stream_encode(inp)
+            print(f"[PYTORCH DEBUG] Init VAE Encoded Latents: shape={latents.shape} mean={latents.mean().item():.4f} std={latents.std().item():.4f}")
             latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
             
             noise = torch.randn_like(latents)
@@ -254,6 +256,7 @@ class SingleGPUInferencePipeline:
                 
                 # VAE encoding
                 latents = self.pipeline.vae.stream_encode(inp)
+                print(f"[PYTORCH DEBUG] VAE Encoded Latents: shape={latents.shape} mean={latents.mean().item():.4f} std={latents.std().item():.4f}")
                 latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
                 
                 noise = torch.randn_like(latents)

@@ -564,15 +564,15 @@ class WanVAE_(nn.Module):
                 )
                 out = torch.cat([out, out_], 2)
         else:
-            out=[]
-            for i in range(t//4):
-                self._enc_conv_idx = [0]
-                out.append(self.encoder(
-                    x[:, :, i*4:(i+1)*4, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx,
-                    ))
-            out = torch.cat(out, 2)
+            # Pass the entire chunk to encoder.
+            # The t//4 loop causes crash for small chunks because T=4 
+            # is insufficient for 2x temporal downsampling with caching.
+            self._enc_conv_idx = [0]
+            out = self.encoder(
+                x,
+                feat_cache=self._enc_feat_map,
+                feat_idx=self._enc_conv_idx,
+            )
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         if scale is not None:
             if isinstance(scale[0], torch.Tensor):
